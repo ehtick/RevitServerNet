@@ -1,14 +1,19 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
-using System.Threading.Tasks;
-using System.Xml;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.ServiceModel;
-using System.ServiceModel.Channels;
 using System.ServiceModel.Description;
+using System.Threading;
+using System.Threading.Tasks;
+using RevitServerNet.Tools;
 
 namespace RevitServerNet.Enterprise
 {
@@ -20,1628 +25,1060 @@ namespace RevitServerNet.Enterprise
 		public string RevitVersion { get; set; }
 		public string AssembliesPath { get; set; }
 		public bool Overwrite { get; set; }
+		public bool CreateLocal { get; set; }
+
+		/// <summary>
+		/// Folder in which the export creates its work folder (and removes old ones); null: <see cref="Path.GetTempPath"/>.
+		/// </summary>
+		public string WorkRoot { get; set; }
 	}
-	internal sealed class RsModelExporter
+
+	/// <summary>
+	/// Endpoint and binding of the Revit Server ModelService (net.tcp, streamed).
+	/// </summary>
+	internal static class RsModelServiceEndpoint
 	{
-		public async Task<string> ExportAsync(RsModelExporterOptions options, IProgress<long> bytesProgress = null)
+		/// <summary>Connecting to the server (Autodesk TcpStreamBinding: 60 s).</summary>
+		public static readonly TimeSpan OpenTimeout = TimeSpan.FromMinutes(1);
+
+		/// <summary>Closing the channel (Autodesk TcpStreamBinding: 60 s).</summary>
+		public static readonly TimeSpan CloseTimeout = TimeSpan.FromMinutes(1);
+
+		/// <summary>
+		/// One call, until its reply starts to arrive (for DownloadFile: until the file stream starts).
+		/// Reading a downloaded file's stream is not limited by it.
+		/// </summary>
+		public static readonly TimeSpan SendTimeout = TimeSpan.FromMinutes(10);
+
+		/// <summary>Receive timeout of the binding (Autodesk TcpStreamBinding: 10 min).</summary>
+		public static readonly TimeSpan ReceiveTimeout = TimeSpan.FromMinutes(10);
+
+		/// <summary>
+		/// Reply timeout of UnlockData after the export was cancelled, instead of <see cref="SendTimeout"/>: the caller cancelled,
+		/// often because the server stopped answering, and should not wait 10 min for the unlock.
+		/// </summary>
+		public static readonly TimeSpan CancelledUnlockTimeout = TimeSpan.FromMinutes(1);
+
+		/// <summary>Largest downloaded model data file: 5 GB.</summary>
+		public const long MaxReceivedMessageSize = 5L * 1024 * 1024 * 1024;
+
+		/// <summary>
+		/// net.tcp://{serverHost}/ModelService{revitVersion}/ModelService.svc/tcpstream
+		/// </summary>
+		/// <param name="serverHost">Host name or IP address, optionally with :port (net.tcp default port is 808).</param>
+		/// <param name="revitVersion">Revit Server year, four digits.</param>
+		/// <exception cref="ArgumentException">Invalid host or version.</exception>
+		public static Uri BuildUri(string serverHost, string revitVersion)
 		{
-			try
-			{
-				ValidateOptions(options);
-
-				var assemblies = RsAssemblyLoader.Load(options.RevitVersion, options.AssembliesPath);
-				bool UseEnvFlag(string name)
-				{
-					try { return !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name)); } catch { return false; }
-				}
-
-
-				object serviceSessionToken;
-				object modelIdentity;
-				object serviceModelSessionToken;
-				object creationDate;
-				(string stage, Exception error) Fail(string stage, Exception ex) => (stage, ex);
-
-				// No longer need to initialize proxy provider here - each method creates its own
-
-				try { serviceSessionToken = CreateServiceSessionToken(assemblies); }
-				catch (Exception ex) { throw new InvalidOperationException($"[ServiceSessionToken] Failed to create. Base='{assemblies.BaseDirectory}'. {ex.GetBaseException().Message}", ex); }
-
-				try { modelIdentity = IdentifyModel(assemblies, options.RevitVersion, options.ServerHost, serviceSessionToken, options.ModelPipePath); }
-				catch (Exception ex) { throw new InvalidOperationException($"[IdentifyModel] Failed. Model='{options.ModelPipePath}'. Host='{options.ServerHost}'. Base='{assemblies.BaseDirectory}'. {ex.GetBaseException().Message}", ex); }
-
-				try
-				{
-					serviceModelSessionToken = CreateServiceModelSessionToken(assemblies, modelIdentity, options.ServerHost, options.ModelPipePath);
-
-					// Diagnostic: Check if ModelIdentity contains ModelLocation
-					try
-					{
-						var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_ModelIdentity_Diagnostic.txt");
-						var identityType = modelIdentity.GetType();
-						var props = identityType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-						System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ModelIdentity properties:\n");
-						foreach (var prop in props)
-						{
-							var val = prop.GetValue(modelIdentity);
-							System.IO.File.AppendAllText(logPath, $"  {prop.Name}={val}\n");
-						}
-					}
-					catch { }
-				}
-				catch (Exception ex) { throw new InvalidOperationException($"[ServiceModelSessionToken] Failed. Base='{assemblies.BaseDirectory}'. {ex.GetBaseException().Message}", ex); }
-
-				// Acquire lock (must succeed as in Altec)
-				creationDate = LockData(assemblies, options.RevitVersion, options.ServerHost, serviceModelSessionToken);
-
-				var tempDir = CreateTempModelDataFolder();
-				try
-				{
-					var fileList = GetModelDataFileList(assemblies, options.RevitVersion, options.ServerHost, serviceModelSessionToken);
-					await DownloadAllFilesAsync(assemblies, options.RevitVersion, options.ServerHost, serviceModelSessionToken, creationDate, fileList, tempDir, bytesProgress);
-
-					GenerateRvtFromModelData(assemblies, tempDir, options.DestinationFile, options.Overwrite);
-				}
-				catch (Exception ex) { throw new InvalidOperationException($"[Download/Generate] Failed. Base='{assemblies.BaseDirectory}'. {ex.GetBaseException().Message}", ex); }
-				finally
-				{
-					TryCleanupTemp(tempDir);
-				}
-
-				return options.DestinationFile;
-			}
-			catch (AmbiguousMatchException ex)
-			{
-				// Debug: Log which method is causing ambiguity
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_ExportAsync_Ambiguity.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ExportAsync ambiguity: {ex.Message}\n");
-				System.IO.File.AppendAllText(logPath, $"Stack trace: {ex.StackTrace}\n");
-				throw new InvalidOperationException($"ExportAsync ambiguity: {ex.Message}", ex);
-			}
+			ValidateRevitVersion(revitVersion);
+			if (string.IsNullOrWhiteSpace(serverHost)) throw new ArgumentException("ServerHost is required", "ServerHost");
+			var host = serverHost.Trim();
+			// A bare IPv6 address needs brackets in a URI.
+			if (IPAddress.TryParse(host, out var ip) && ip.AddressFamily == AddressFamily.InterNetworkV6 && !host.StartsWith("[", StringComparison.Ordinal))
+				host = "[" + host + "]";
+			var path = "/ModelService" + revitVersion + "/ModelService.svc/tcpstream";
+			if (!Uri.TryCreate("net.tcp://" + host + path, UriKind.Absolute, out var uri)
+				|| uri.AbsolutePath != path || uri.Query.Length > 0 || uri.Fragment.Length > 0 || uri.UserInfo.Length > 0)
+				throw new ArgumentException($"ServerHost '{serverHost}' must be a host name or IP address, optionally with :port (no scheme or path).", "ServerHost");
+			return uri;
 		}
 
-		private static void ValidateOptions(RsModelExporterOptions options)
+		/// <exception cref="ArgumentException"><paramref name="revitVersion"/> is not a four-digit year.</exception>
+		public static void ValidateRevitVersion(string revitVersion)
+		{
+			if (revitVersion == null || revitVersion.Length != 4 || revitVersion.Any(c => c < '0' || c > '9'))
+				throw new ArgumentException($"RevitVersion must be a four-digit year (for example \"2024\"), got '{revitVersion}'.", "RevitVersion");
+		}
+
+		/// <summary>
+		/// NetTcpBinding without security, streamed transfer, reader quotas and buffer sizes of the Autodesk TcpStreamBinding,
+		/// 5 GB message limit. PortSharingEnabled (set by Autodesk's binding) is not used: it does not exist in WCF for .NET Core,
+		/// and the export works without it on both runtimes.
+		/// </summary>
+		public static NetTcpBinding CreateBinding()
+		{
+			var binding = new NetTcpBinding(SecurityMode.None)
+			{
+				TransferMode = TransferMode.Streamed,
+				MaxReceivedMessageSize = MaxReceivedMessageSize,
+				MaxBufferSize = 655360,
+				MaxBufferPoolSize = 655360,
+				OpenTimeout = OpenTimeout,
+				CloseTimeout = CloseTimeout,
+				SendTimeout = SendTimeout,
+				ReceiveTimeout = ReceiveTimeout,
+			};
+			binding.ReaderQuotas.MaxArrayLength = 16384;
+			binding.ReaderQuotas.MaxBytesPerRead = 4096;
+			binding.ReaderQuotas.MaxDepth = 32;
+			binding.ReaderQuotas.MaxNameTableCharCount = 16384;
+			binding.ReaderQuotas.MaxStringContentLength = 30720;
+			return binding;
+		}
+	}
+
+	/// <summary>
+	/// Retries of the lock calls. <see cref="Default"/> follows RevitServerTool (DataStorageToolClient.LockData/UnlockData:
+	/// 5 attempts, 10 s apart).
+	/// </summary>
+	internal sealed class RsExportRetryPolicy
+	{
+		public static readonly RsExportRetryPolicy Default =
+			new RsExportRetryPolicy(5, TimeSpan.FromSeconds(10), 5, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(5));
+
+		public RsExportRetryPolicy(int lockAttempts, TimeSpan lockRetryDelay, int unlockAttempts, TimeSpan unlockRetryDelay, TimeSpan interruptedLockDelay)
+		{
+			if (lockAttempts < 1) throw new ArgumentOutOfRangeException(nameof(lockAttempts));
+			if (unlockAttempts < 1) throw new ArgumentOutOfRangeException(nameof(unlockAttempts));
+			LockAttempts = lockAttempts;
+			LockRetryDelay = lockRetryDelay;
+			UnlockAttempts = unlockAttempts;
+			UnlockRetryDelay = unlockRetryDelay;
+			InterruptedLockDelay = interruptedLockDelay;
+		}
+
+		/// <summary>LockData attempts while the server answers Busy or with a lock contention fault.</summary>
+		public int LockAttempts { get; }
+
+		/// <summary>Wait before a LockData retry (cancellable).</summary>
+		public TimeSpan LockRetryDelay { get; }
+
+		/// <summary>UnlockData attempts while it fails with a communication error.</summary>
+		public int UnlockAttempts { get; }
+
+		/// <summary>Wait before an UnlockData retry (not cancellable, like the unlock itself).</summary>
+		public TimeSpan UnlockRetryDelay { get; }
+
+		/// <summary>
+		/// Wait before the second UnlockData when LockData was interrupted (aborted or timed out) and the first UnlockData found no lock:
+		/// the server may still be processing that LockData (it retries each lock file for up to 2 s).
+		/// </summary>
+		public TimeSpan InterruptedLockDelay { get; }
+	}
+
+	/// <summary>
+	/// Server side of one export: the ModelService calls of RevitServerTool createLocalRVT and the Autodesk Helper steps that build the RVT file.
+	/// <see cref="RsModelExporter"/> decides the order, the lock lifecycle, the retries and the error reporting.
+	/// </summary>
+	internal interface IModelExportSession
+	{
+		/// <summary>IdentifyModel; throws when the server returns no valid model identity.</summary>
+		void IdentifyModel(CancellationToken ct);
+
+		/// <summary>
+		/// LockData (non-exclusive read lock); returns the LockStatus name. Calls <paramref name="lockMayBeHeld"/> right before the request
+		/// is sent: from then on, until the server answers, the lock may have been taken (for example when the call is aborted or times out).
+		/// </summary>
+		string LockData(Action lockMayBeHeld, CancellationToken ct);
+
+		/// <summary>GetListOfModelDataFilesWithoutLocking; returns the ValidationStatus name.</summary>
+		string GetListOfModelDataFiles(CancellationToken ct, out List<string> files);
+
+		/// <summary>DownloadFile; the caller reads <paramref name="stream"/> and disposes the returned response.</summary>
+		IDisposable DownloadFile(string file, CancellationToken ct, out Stream stream);
+
+		/// <summary>ModelDataFormatVersion (the boxed DataFormatVersion).</summary>
+		object ModelDataFormatVersion(CancellationToken ct);
+
+		/// <summary>
+		/// UnlockData; returns the LockStatus name. Not cancellable; when <paramref name="cancelled"/> is true, the reply is awaited for
+		/// <see cref="RsModelServiceEndpoint.CancelledUnlockTimeout"/> at most.
+		/// </summary>
+		string UnlockData(bool cancelled);
+
+		/// <summary>Aborts the connection: a waiting call fails at once, and the next call opens a new connection.</summary>
+		void Abort();
+
+		/// <summary>Closes the connection; no server call follows.</summary>
+		void Close();
+
+		/// <summary>Assembles the RVT file from the downloaded model data (Autodesk Helper).</summary>
+		void GenerateRvtFile(string dataDirectory, object dataFormatVersion, string rvtPath);
+
+		/// <summary>Rewrites the BasicFileInfo of the RVT file as a local copy of the server model (Autodesk Helper).</summary>
+		void MakeCreatedLocal(string rvtPath, object dataFormatVersion);
+	}
+
+	/// <summary>
+	/// Direct export of a Revit Server model to an RVT file over the ModelService, following RevitServerTool createLocalRVT:
+	/// IdentifyModel, LockData (read lock), GetListOfModelDataFilesWithoutLocking, DownloadFile per file, ModelDataFormatVersion,
+	/// UnlockData (always, once the lock may be held), then the RVT is assembled with the Autodesk Helper.
+	/// </summary>
+	internal sealed class RsModelExporter
+	{
+		/// <summary>Data key of the UnlockData failure attached to the exception that ended an export.</summary>
+		internal const string UnlockErrorDataKey = "RevitServerNet.UnlockDataError";
+
+		/// <summary>Data key of the temp folder cleanup failure attached to the exception that ended an export.</summary>
+		internal const string TempCleanupErrorDataKey = "RevitServerNet.TempCleanupError";
+
+		/// <summary>
+		/// Data key of the destination file, set on the exception thrown when only releasing the read lock failed:
+		/// the RVT file is complete at that path.
+		/// </summary>
+		internal const string ExportedFileDataKey = "RevitServerNet.ExportedFile";
+
+		/// <summary>
+		/// Data key of the error raised while closing a download that ended early; the download's own exception is the one thrown.
+		/// </summary>
+		internal const string DownloadCloseErrorDataKey = "RevitServerNet.DownloadCloseError";
+
+		/// <summary>
+		/// Data key of the warning that the read lock was already released when UnlockData ran, attached to the exception that ended an export.
+		/// </summary>
+		internal const string ReadLockLostDataKey = "RevitServerNet.ReadLockLost";
+
+		/// <summary>Data key of the failure to delete the partly moved file next to the destination.</summary>
+		internal const string PartialFileCleanupErrorDataKey = "RevitServerNet.PartialFileCleanupError";
+
+		/// <summary>Prefix of the export's work folder, "{prefix}{guid:N}".</summary>
+		internal const string WorkDirectoryPrefix = "RevitServerNet_";
+
+		/// <summary>
+		/// Age after which a work folder left behind (a failed cleanup or a killed process) is deleted by a later export,
+		/// as RevitServerTool does with its own temp folders.
+		/// </summary>
+		internal static readonly TimeSpan StaleWorkDirectoryAge = TimeSpan.FromDays(7);
+
+		/// <summary>
+		/// Longest mutex name used as is; a longer name is replaced by a hash. 260 characters is the limit of a mutex name on .NET Framework
+		/// (MAX_PATH), so every name RevitServerTool can create itself is used unchanged.
+		/// </summary>
+		internal const int MaxModelMutexNameLength = 260;
+
+		/// <summary>
+		/// Work folders of this version ("RevitServerNet_{guid}") and of versions before 1.3.0 ("RevitServerNet_ModelData_{guid}").
+		/// </summary>
+		private static readonly Regex WorkDirectoryName = new Regex("^RevitServerNet_(ModelData_)?[0-9a-f]{32}$", RegexOptions.CultureInvariant);
+
+		/// <summary>
+		/// User name of the export's session tokens; the server keeps the read lock under this name.
+		/// Same name as before 1.3.0 (RevitServerTool pattern "RevitServerTool:{machine}:{n}", where RevitServerTool's n is the number
+		/// of its installation folder on the machine, so only the installation with number 1 uses this name).
+		/// </summary>
+		internal static string ExportUserName => $"RevitServerTool:{Environment.MachineName}:1";
+
+		public Task<string> ExportAsync(RsModelExporterOptions options, IProgress<long> bytesProgress = null, CancellationToken cancellationToken = default)
+		{
+			return ExportAsync(options, bytesProgress, cancellationToken, (o, endpoint, where) => new ModelServiceSession(o, endpoint, where), RsExportRetryPolicy.Default);
+		}
+
+		/// <summary>
+		/// Export with the given server session and retry policy.
+		/// </summary>
+		/// <param name="sessionFactory">Creates the session from the options, the endpoint and the model description used in messages.</param>
+		internal async Task<string> ExportAsync(RsModelExporterOptions options, IProgress<long> bytesProgress, CancellationToken cancellationToken,
+			Func<RsModelExporterOptions, Uri, string, IModelExportSession> sessionFactory, RsExportRetryPolicy retryPolicy)
+		{
+			var endpoint = ValidateOptions(options);
+			cancellationToken.ThrowIfCancellationRequested();
+			PrepareDestination(options);
+			// All service calls are synchronous WCF calls: run them off the caller's thread.
+			return await Task.Run(() => Export(options, endpoint, bytesProgress, cancellationToken, sessionFactory, retryPolicy), CancellationToken.None).ConfigureAwait(false);
+		}
+
+		/// <summary>
+		/// Checks the options without side effects and returns the ModelService endpoint.
+		/// </summary>
+		internal static Uri ValidateOptions(RsModelExporterOptions options)
 		{
 			if (options == null) throw new ArgumentNullException(nameof(options));
 			if (string.IsNullOrWhiteSpace(options.ServerHost)) throw new ArgumentException("ServerHost is required", nameof(options.ServerHost));
 			if (string.IsNullOrWhiteSpace(options.ModelPipePath)) throw new ArgumentException("ModelPipePath is required", nameof(options.ModelPipePath));
 			if (string.IsNullOrWhiteSpace(options.DestinationFile)) throw new ArgumentException("DestinationFile is required", nameof(options.DestinationFile));
 			if (string.IsNullOrWhiteSpace(options.RevitVersion)) throw new ArgumentException("RevitVersion is required", nameof(options.RevitVersion));
+			return RsModelServiceEndpoint.BuildUri(options.ServerHost, options.RevitVersion);
+		}
+
+		private static void PrepareDestination(RsModelExporterOptions options)
+		{
 			var dir = Path.GetDirectoryName(options.DestinationFile);
 			if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 			if (File.Exists(options.DestinationFile) && !options.Overwrite)
 				throw new IOException("Destination file already exists. Set Overwrite=true to replace.");
 		}
 
-		private static string CreateTempModelDataFolder()
+		private static string Export(RsModelExporterOptions options, Uri endpoint, IProgress<long> progress, CancellationToken ct,
+			Func<RsModelExporterOptions, Uri, string, IModelExportSession> sessionFactory, RsExportRetryPolicy retryPolicy)
 		{
-			var name = $"RevitServerNet_ModelData_{Guid.NewGuid():N}";
-			var dir = Path.Combine(Path.GetTempPath(), name);
-			Directory.CreateDirectory(dir);
-			return dir;
-		}
+			var serverHost = options.ServerHost.Trim();
+			var modelPath = PathUtils.ConvertPipePathToRelativeWindowsPath(options.ModelPipePath);
+			var where = $"model '{options.ModelPipePath}' at {endpoint}";
+			var userName = ExportUserName;
 
-		private static object CreateServiceSessionToken(RsAssemblies assemblies)
-		{
-			var type = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.SessionToken.ServiceSessionToken");
-			var ctor = type.GetConstructor(new[] { typeof(string), typeof(string), typeof(string), typeof(string) });
-			if (ctor == null) throw new MissingMethodException(type.FullName, ".ctor(string,string,string,string)");
-			// Use the same username pattern as the original tool for compatibility with RS
-			var userName = $"RevitServerTool:{Environment.MachineName}:1";
-			var token = ctor.Invoke(new object[] { userName, string.Empty, Environment.MachineName, Guid.NewGuid().ToString() });
-			return token;
-		}
-
-		private static object CreateServiceModelSessionToken(RsAssemblies assemblies, object modelIdentity, string serverHost, string modelPipePath)
-		{
-			var type = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.SessionToken.ServiceModelSessionToken");
-			var ctor = type.GetConstructor(new[] { FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.ModelIdentity"), typeof(string), typeof(string), typeof(string), typeof(string) });
-			if (ctor == null) throw new MissingMethodException(type.FullName, ".ctor(ModelIdentity,string,string,string,string)");
-			// Match Altec/Tool username pattern for model session
-			var userName = $"RevitServerTool:{Environment.MachineName}:1";
-			var token = ctor.Invoke(new object[] { modelIdentity, userName, string.Empty, Environment.MachineName, Guid.NewGuid().ToString() });
-			// set ModelLocation property
-			var modelLocation = CreateModelLocation(assemblies, serverHost, modelPipePath);
-			var prop = type.GetProperty("ModelLocation", BindingFlags.Public | BindingFlags.Instance);
-			if (prop != null)
+			var workRoot = options.WorkRoot ?? Path.GetTempPath();
+			var workDir = Path.Combine(workRoot, WorkDirectoryPrefix + Guid.NewGuid().ToString("N"));
+			var dataDir = Path.Combine(workDir, "data");
+			Exception failure = null;
+			// UnlockData failure after an otherwise successful locked phase: reported once the file is in place.
+			Exception unlockFailure = null;
+			var unlockFailureThrown = false;
+			try
 			{
+				var session = sessionFactory(options, endpoint, where);
+				Directory.CreateDirectory(dataDir);
+
+				object dataFormatVersion;
 				try
 				{
-					var debugLog = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_SessionToken_Debug.txt");
-					System.IO.File.AppendAllText(debugLog, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ModelLocation property CanWrite={prop.CanWrite}\n");
-					if (prop.CanWrite)
-					{
-						prop.SetValue(token, modelLocation);
-						var checkVal = prop.GetValue(token);
-						System.IO.File.AppendAllText(debugLog, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] After SetValue, ModelLocation={checkVal}\n");
-					}
-				}
-				catch { }
-			}
-			return token;
-		}
+					using (ct.Register(session.Abort))
+						Call("IdentifyModel", where, ct, () =>
+						{
+							session.IdentifyModel(ct);
+							return true;
+						});
 
-		// Create a new ServiceModelSessionToken from existing one (for file downloads)
-		// AltecSystems creates a NEW token for EACH file download with a new operation GUID
-		private static object CreateServiceModelSessionTokenFromExisting(RsAssemblies assemblies, object existingToken)
-		{
-			try
-			{
-				var type = existingToken.GetType();
-				var modelIdentityProp = type.GetProperty("ModelIdentity", BindingFlags.Public | BindingFlags.Instance);
-				var modelLocationProp = type.GetProperty("ModelLocation", BindingFlags.Public | BindingFlags.Instance);
-				var userNameProp = type.GetProperty("UserName", BindingFlags.Public | BindingFlags.Instance);
-				var ssoUserNameProp = type.GetProperty("SsoUserName", BindingFlags.Public | BindingFlags.Instance);
-				var machineNameProp = type.GetProperty("MachineName", BindingFlags.Public | BindingFlags.Instance);
-
-				var modelIdentity = modelIdentityProp?.GetValue(existingToken);
-				var modelLocation = modelLocationProp?.GetValue(existingToken);
-				var userName = userNameProp?.GetValue(existingToken) as string ?? $"RevitServerTool:{Environment.MachineName}:1";
-				var ssoUserName = ssoUserNameProp?.GetValue(existingToken) as string ?? string.Empty;
-				var machineName = machineNameProp?.GetValue(existingToken) as string ?? Environment.MachineName;
-
-				var ctor = type.GetConstructor(new[] { FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.ModelIdentity"), typeof(string), typeof(string), typeof(string), typeof(string) });
-				if (ctor == null) throw new MissingMethodException(type.FullName, ".ctor(ModelIdentity,string,string,string,string)");
-
-				// Create new token with a NEW operation GUID (critical!)
-				var newToken = ctor.Invoke(new object[] { modelIdentity, userName, ssoUserName, machineName, Guid.NewGuid().ToString() });
-
-				// Copy ModelLocation
-				var prop = type.GetProperty("ModelLocation", BindingFlags.Public | BindingFlags.Instance);
-				if (prop != null && prop.CanWrite && modelLocation != null)
-					prop.SetValue(newToken, modelLocation);
-
-				return newToken;
-			}
-			catch (AmbiguousMatchException ex)
-			{
-				// Debug: Log which property is causing ambiguity
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_CreateServiceModelSessionToken_Ambiguity.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] CreateServiceModelSessionTokenFromExisting ambiguity: {ex.Message}\n");
-				System.IO.File.AppendAllText(logPath, $"Stack trace: {ex.StackTrace}\n");
-				throw new InvalidOperationException($"CreateServiceModelSessionTokenFromExisting ambiguity: {ex.Message}", ex);
-			}
-		}
-
-		private static object CreateModelLocation(RsAssemblies assemblies, string serverHost, string modelPipePath)
-		{
-			var type = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.ModelLocation");
-			var enumType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.ModelLocationType");
-			var serverEnum = Enum.Parse(enumType, "Server");
-
-			// CRITICAL: AltecSystems ВСЕГДА использует Windows-style path (e.g. "Base\In\test.rvt") для ModelLocation
-			// Это ОБЯЗАТЕЛЬНОЕ условие для работы LockData!
-			var path = ConvertPipePathToRelativeWindowsPath(modelPipePath);
-			
-			// DEBUG: Log what we're passing to constructor
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_ModelLocation_Diagnostic.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] CreateModelLocation constructor args:\n");
-				System.IO.File.AppendAllText(logPath, $"  serverHost='{serverHost}'\n");
-				System.IO.File.AppendAllText(logPath, $"  path='{path}'\n");
-				System.IO.File.AppendAllText(logPath, $"  originalPipePath='{modelPipePath}'\n");
-				System.IO.File.AppendAllText(logPath, $"  serverEnum={serverEnum}\n");
-			}
-			catch { }
-
-			// DEBUG: List all available constructors
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_ModelLocation_Constructors.txt");
-				var constructors = type.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ModelLocation constructors ({constructors.Length}):\n");
-				foreach (var ctor in constructors)
-				{
-					var paramTypes = ctor.GetParameters().Select(p => p.ParameterType.Name).ToArray();
-					System.IO.File.AppendAllText(logPath, $"  - {string.Join(", ", paramTypes)}\n");
-				}
-			}
-			catch { }
-
-			// CRITICAL: Use EXACTLY the same constructor as AltecSystems
-			// AltecSystems: new ModelLocation(HostIp, ModelPath, ModelLocationType.Server)
-			// This MUST be the 3-parameter constructor that sets Server field internally
-			var ctor3 = type.GetConstructor(new[] { typeof(string), typeof(string), enumType });
-			if (ctor3 == null)
-			{
-				throw new MissingMethodException(type.FullName, "Constructor(string, string, ModelLocationType) not found - this is required for AltecSystems compatibility");
-			}
-			
-			// Use correct parameter order: (serverHost, path, serverEnum) as per AltecSystems
-			var ml = ctor3.Invoke(new object[] { serverHost, path, serverEnum });
-			
-			// CRITICAL: Try to set Server field after construction (patched DLL might not set it in constructor)
-			try
-			{
-				var serverProp = type.GetProperty("Server");
-				if (serverProp != null && serverProp.CanWrite)
-				{
-					serverProp.SetValue(ml, serverHost);
-				}
-				else
-				{
-					// Try to find Server field
-					var serverField = type.GetField("Server", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
-					if (serverField != null)
-					{
-						serverField.SetValue(ml, serverHost);
-					}
-				}
-			}
-			catch { }
-			
-			// DEBUG: Log the created ModelLocation to verify it's correct
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_ModelLocation_Diagnostic.txt");
-				var serverProp = type.GetProperty("Server");
-				var centralServerProp = type.GetProperty("CentralServer");
-				var relativePathProp = type.GetProperty("RelativePath");
-				var typeProp = type.GetProperty("Type");
-				
-				var serverVal = serverProp?.GetValue(ml);
-				var centralServerVal = centralServerProp?.GetValue(ml);
-				var relativePathVal = relativePathProp?.GetValue(ml);
-				var typeVal = typeProp?.GetValue(ml);
-				
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ModelLocation created via ctor: Server={serverVal}, CentralServer={centralServerVal}, RelativePath={relativePathVal}, Type={typeVal}, serverHost={serverHost}, path={path}\n");
-				
-				// DEBUG: List ALL properties to see what's available
-				var allProps = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] All ModelLocation properties ({allProps.Length}):\n");
-				foreach (var prop in allProps)
-				{
-					var val = prop.GetValue(ml);
-					System.IO.File.AppendAllText(logPath, $"  - {prop.Name} ({prop.PropertyType.Name}): {val}\n");
-				}
-			}
-			catch { }
-
-			return ml;
-		}
-
-		private static object IdentifyModel(RsAssemblies assemblies, String revitVersion, String serverHost, Object serviceSessionToken, string modelPipePath)
-		{
-			var clientProxy = GetGenericClientProxy(assemblies, revitVersion, serverHost, useStreamed: false);
-			var proxy = GetProxyFromClientProxy(clientProxy);
-			var iModelServiceType = assemblies.GetType("Autodesk.RevitServer.Enterprise.Common.ClientServer.ServiceContract.Model.IModelService");
-			var identifyMethod = iModelServiceType.GetMethod("IdentifyModel", BindingFlags.Public | BindingFlags.Instance);
-			if (identifyMethod == null) throw new MissingMethodException(iModelServiceType.FullName, "IdentifyModel");
-			// Altec передаёт Windows-путь (замена | на \) для IdentifyModel
-			var path = ConvertPipePathToRelativeWindowsPath(modelPipePath);
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_IdentifyModel_Diagnostic.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] IdentifyModel called: path='{path}', original='{modelPipePath}'\n");
-			}
-			catch { }
-			var result = identifyMethod.Invoke(proxy, new object[] { serviceSessionToken, path, true });
-			System.Diagnostics.Debug.WriteLine($"[IdentifyModel] result={result}");
-			return result;
-		}
-
-		private static object LockData(RsAssemblies assemblies, String revitVersion, String serverHost, Object serviceModelSessionToken)
-		{
-			var clientProxy = GetGenericClientProxy(assemblies, revitVersion, serverHost, useStreamed: false);
-			var proxy = GetProxyFromClientProxy(clientProxy);
-			var iModelServiceType = assemblies.GetType("Autodesk.RevitServer.Enterprise.Common.ClientServer.ServiceContract.Model.IModelService");
-			var lockData = iModelServiceType.GetMethod("LockData", BindingFlags.Public | BindingFlags.Instance);
-			if (lockData == null) throw new MissingMethodException(iModelServiceType.FullName, "LockData");
-
-			var modelVersionType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.ModelVersion");
-			var versionNumberType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.VersionNumber");
-			var historyCheckInfoType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.ModelHistoryCheckInfo");
-			var episodeGuidType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.EpisodeGuid");
-
-			// DEBUG: List all available fields and properties on EpisodeGuid
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_EpisodeGuid_Debug.txt");
-				var fields = episodeGuidType.GetFields(BindingFlags.Public | BindingFlags.Static);
-				var properties = episodeGuidType.GetProperties(BindingFlags.Public | BindingFlags.Static);
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] EpisodeGuid fields ({fields.Length}):\n");
-				foreach (var field in fields)
-				{
-					var val = field.GetValue(null);
-					System.IO.File.AppendAllText(logPath, $"  - {field.Name} ({field.FieldType.Name}): {val}\n");
-				}
-				System.IO.File.AppendAllText(logPath, $"EpisodeGuid properties ({properties.Length}):\n");
-				foreach (var prop in properties)
-				{
+					var modelMutex = AcquireModelMutex(userName, modelPath, serverHost, where, ct);
 					try
 					{
-						var val = prop.GetValue(null);
-						System.IO.File.AppendAllText(logPath, $"  - {prop.Name} ({prop.PropertyType.Name}): {val}\n");
-					}
-					catch (Exception ex)
-					{
-						System.IO.File.AppendAllText(logPath, $"  - {prop.Name} ({prop.PropertyType.Name}): ERROR - {ex.Message}\n");
-					}
-				}
-			}
-			catch { }
-
-			var episodeInvalid = episodeGuidType.GetProperty("Invalid", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-			if (episodeInvalid == null) throw new InvalidOperationException("EpisodeGuid.Invalid property is null");
-			
-			var historyCtor = historyCheckInfoType.GetConstructor(new[] { episodeGuidType });
-			if (historyCtor == null) throw new MissingMethodException(historyCheckInfoType.FullName, "Constructor(EpisodeGuid)");
-			var history = historyCtor.Invoke(new[] { episodeInvalid });
-			if (history == null) throw new InvalidOperationException("ModelHistoryCheckInfo creation failed");
-			
-			var versionNumberCtor = versionNumberType.GetConstructor(new[] { typeof(int) });
-			if (versionNumberCtor == null) throw new MissingMethodException(versionNumberType.FullName, "Constructor(int)");
-			var versionNumber = versionNumberCtor.Invoke(new object[] { 0 });
-			if (versionNumber == null) throw new InvalidOperationException("VersionNumber creation failed");
-			
-			var modelVersionCtor = modelVersionType.GetConstructor(new[] { versionNumberType, historyCheckInfoType });
-			if (modelVersionCtor == null) throw new MissingMethodException(modelVersionType.FullName, "Constructor(VersionNumber, ModelHistoryCheckInfo)");
-			var modelVersion = modelVersionCtor.Invoke(new[] { versionNumber, history });
-			if (modelVersion == null) throw new InvalidOperationException("ModelVersion creation failed");
-
-			// Prepare args with out parameter
-			var args = new object[] { serviceModelSessionToken, (uint)129, true, modelVersion, null };
-
-			// ДЕТАЛЬНАЯ ДИАГНОСТИКА: вывести ВСЕ параметры LockData в файл
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_LockData_Diagnostic.txt");
-				using (var sw = new System.IO.StreamWriter(logPath, true, System.Text.Encoding.UTF8))
-				{
-					sw.WriteLine($"\n========== LockData called at {DateTime.Now:yyyy-MM-dd HH:mm:ss} ==========");
-					sw.WriteLine($"ServerHost: {serverHost}");
-					sw.WriteLine($"LockOptions: 129");
-					sw.WriteLine($"AllowNonExclusive: true");
-					sw.WriteLine($"ModelVersion: {modelVersion}");
-					sw.WriteLine($"SessionToken Type: {serviceModelSessionToken.GetType().FullName}");
-
-					var tokenType = serviceModelSessionToken.GetType();
-
-					// Dump ALL properties of ServiceModelSessionToken
-					sw.WriteLine("\n--- ServiceModelSessionToken Properties ---");
-					var allProps = tokenType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-					foreach (var prop in allProps)
-					{
+						var lockMayBeHeld = false;
+						// LockData returned (with any status); false while a LockData request may still be processed by the server.
+						var lockDataReturned = false;
+						string lockStatus = null;
+						Exception lockedPhaseFailure = null;
 						try
 						{
-							var val = prop.GetValue(serviceModelSessionToken);
-							sw.WriteLine($"  {prop.Name} ({prop.PropertyType.Name}): {val}");
-
-							// Special handling for ModelLocation
-							if (prop.Name == "ModelLocation" && val != null)
+							using (ct.Register(session.Abort))
 							{
-								sw.WriteLine("    --- ModelLocation Details ---");
-								var mlType = val.GetType();
-								var mlProps = mlType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-								foreach (var mlProp in mlProps)
+								lockStatus = LockWithRetry(() =>
 								{
+									lockDataReturned = false;
+									string status;
 									try
 									{
-										var mlVal = mlProp.GetValue(val);
-										sw.WriteLine($"      {mlProp.Name}: {mlVal}");
+										status = Call("LockData", where, ct, () => session.LockData(() => lockMayBeHeld = true, ct));
 									}
-									catch (Exception ex)
+									catch (InvalidOperationException ex) when (ex.InnerException is FaultException)
 									{
-										sw.WriteLine($"      {mlProp.Name}: ERROR - {ex.Message}");
+										// The server answered with a fault: it did not lock.
+										lockMayBeHeld = false;
+										throw;
 									}
-								}
-							}
+									lockDataReturned = true;
+									// Any status but Locked/WasLocked: the server did not lock.
+									if (status != "Locked" && status != "WasLocked") lockMayBeHeld = false;
+									return status;
+								}, retryPolicy.LockAttempts, retryPolicy.LockRetryDelay, ct, out var lockAttempts);
+								if (lockStatus != "Locked" && lockStatus != "WasLocked")
+									throw new InvalidOperationException(
+										$"LockData returned {lockStatus} for {where}{(lockAttempts > 1 ? $" after {lockAttempts} attempts" : string.Empty)}: {ExplainLockStatus(lockStatus)}");
 
-							// Special handling for ModelIdentity
-							if (prop.Name == "ModelIdentity" && val != null)
-							{
-								sw.WriteLine("    --- ModelIdentity Details ---");
-								var miType = val.GetType();
-								var miProps = miType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-								foreach (var miProp in miProps)
+								var listing = Call("GetListOfModelDataFilesWithoutLocking", where, ct, () =>
 								{
-									try
-									{
-										var miVal = miProp.GetValue(val);
-										sw.WriteLine($"      {miProp.Name}: {miVal}");
-									}
-									catch (Exception ex)
-									{
-										sw.WriteLine($"      {miProp.Name}: ERROR - {ex.Message}");
-									}
+									var status = session.GetListOfModelDataFiles(ct, out var list);
+									return Tuple.Create(status, list);
+								});
+								if (listing.Item1 != "Success")
+									throw new InvalidOperationException($"GetListOfModelDataFilesWithoutLocking returned {listing.Item1} for {where}: {ExplainValidationStatus(listing.Item1)}");
+								var files = listing.Item2;
+								if (files == null || files.Count == 0)
+									throw new InvalidOperationException($"GetListOfModelDataFilesWithoutLocking returned no model data files for {where}.");
+
+								foreach (var file in files)
+								{
+									ct.ThrowIfCancellationRequested();
+									var fileName = Path.GetFileName(file);
+									if (string.IsNullOrEmpty(fileName))
+										throw new InvalidOperationException($"GetListOfModelDataFilesWithoutLocking returned an invalid file name '{file}' for {where}.");
+									var target = Path.Combine(dataDir, fileName);
+									Call("DownloadFile " + file, where, ct, () => Download(session, file, target, where, progress, ct));
 								}
+
+								dataFormatVersion = Call("ModelDataFormatVersion", where, ct, () => session.ModelDataFormatVersion(ct));
 							}
 						}
 						catch (Exception ex)
 						{
-							sw.WriteLine($"  {prop.Name}: ERROR - {ex.Message}");
+							lockedPhaseFailure = ex;
+							throw;
 						}
-					}
-
-					sw.WriteLine("========================================\n");
-				}
-			}
-			catch (Exception ex)
-			{
-				Console.WriteLine($"[DIAGNOSTIC ERROR] {ex.Message}");
-			}
-
-			try
-			{
-				lockData.Invoke(proxy, args);
-			}
-			catch (TargetInvocationException tie) when (TryGetFaultException(tie.InnerException, out var faultEx))
-			{
-				// ДЕТАЛЬНОЕ логирование ServiceFault
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_LockData_Fault.txt");
-				try
-				{
-					using (var sw = new System.IO.StreamWriter(logPath, true, System.Text.Encoding.UTF8))
-					{
-						sw.WriteLine($"\n========== LockData Fault at {DateTime.Now:yyyy-MM-dd HH:mm:ss} ==========");
-						sw.WriteLine($"FaultException Type: {faultEx.GetType().FullName}");
-						sw.WriteLine($"Message: {faultEx.Message}");
-
-						var detailProp = faultEx.GetType().GetProperty("Detail");
-						var detail = detailProp?.GetValue(faultEx);
-						if (detail != null)
+						finally
 						{
-							sw.WriteLine($"Detail Type: {detail.GetType().FullName}");
-							sw.WriteLine($"Detail: {detail}");
-
-							// Dump all properties of ServiceFault
-							var detailType = detail.GetType();
-							var detailProps = detailType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-							sw.WriteLine("\n--- ServiceFault Properties ---");
-							foreach (var prop in detailProps)
+							// Always release the read lock once it may be held (RevitServerTool does the same in a finally block),
+							// also after cancellation: the unlock is not cancellable and uses a new channel if the old one was aborted.
+							if (lockMayBeHeld)
 							{
-								try
+								var unlockError = ReleaseReadLock(session, where, lockDataReturned, ct.IsCancellationRequested, retryPolicy, out var lockAlreadyReleased);
+								if (unlockError != null)
 								{
-									var val = prop.GetValue(detail);
-									sw.WriteLine($"  {prop.Name}: {val}");
+									var description = DescribeUnlockFailure(unlockError, userName);
+									if (lockedPhaseFailure != null) lockedPhaseFailure.Data[UnlockErrorDataKey] = description;
+									else unlockFailure = new InvalidOperationException(description, unlockError);
 								}
-								catch (Exception ex)
+								else if (lockAlreadyReleased)
 								{
-									sw.WriteLine($"  {prop.Name}: ERROR - {ex.Message}");
+									// Not an error: the file is usually consistent, and failing would turn a finished export into a failure.
+									var warning = DescribeLostReadLock(userName, where, lockStatus);
+									if (lockedPhaseFailure != null) lockedPhaseFailure.Data[ReadLockLostDataKey] = warning;
+									else Trace.TraceWarning("RevitServerNet: " + warning);
 								}
 							}
 						}
-						sw.WriteLine("========================================\n");
+					}
+					finally
+					{
+						modelMutex.ReleaseMutex();
+						modelMutex.Dispose();
 					}
 				}
-				catch { }
+				finally
+				{
+					session.Close();
+				}
 
-				var detailProp2 = faultEx.GetType().GetProperty("Detail");
-				var detail2 = detailProp2?.GetValue(faultEx);
-				string detailStr = detail2 != null ? $" Detail={detail2}" : "";
-				throw new InvalidOperationException($"Server Fault: {faultEx.Message}{detailStr}", faultEx);
-			}
-			return args[4]; // creationDate (EpisodeGuid)
-		}
-
-		private static bool TryGetFaultException(Exception ex, out Exception faultException)
-		{
-			faultException = null;
-			if (ex == null) return false;
-			var type = ex.GetType();
-			if (type.FullName == "System.ServiceModel.FaultException")
-			{
-				faultException = ex;
-				return true;
-			}
-			if (type.IsGenericType && type.GetGenericTypeDefinition().FullName == "System.ServiceModel.FaultException`1")
-			{
-				faultException = ex;
-				return true;
-			}
-			if (type.Name.StartsWith("FaultException", StringComparison.Ordinal))
-			{
-				faultException = ex;
-				return true;
-			}
-			return false;
-		}
-
-		private static IEnumerable<string> GetModelDataFileList(RsAssemblies assemblies, String revitVersion, String serverHost, Object serviceModelSessionToken)
-		{
-			var clientProxy = GetGenericClientProxy(assemblies, revitVersion, serverHost, useStreamed: false);
-			var proxy = GetProxyFromClientProxy(clientProxy);
-			var iModelServiceType = assemblies.GetType("Autodesk.RevitServer.Enterprise.Common.ClientServer.ServiceContract.Model.IModelService");
-			var method = iModelServiceType.GetMethod("GetListOfModelDataFilesWithoutLocking", BindingFlags.Public | BindingFlags.Instance);
-			if (method == null) throw new MissingMethodException(iModelServiceType.FullName, "GetListOfModelDataFilesWithoutLocking");
-			var args = new object[] { serviceModelSessionToken, null };
-			method.Invoke(proxy, args);
-			var list = args[1] as IEnumerable;
-			if (list == null) return Enumerable.Empty<string>();
-			var result = new List<string>();
-			foreach (var x in list) if (x != null) result.Add(x.ToString());
-			return result;
-		}
-
-		private static async Task DownloadAllFilesAsync(
-			RsAssemblies assemblies,
-			String revitVersion,
-			String serverHost,
-			Object serviceModelSessionToken,
-			object creationDate,
-			IEnumerable<string> fileList,
-			string tempDir,
-			IProgress<long> progress)
-		{
-			object clientProxy;
-			try
-			{
-				clientProxy = GetGenericClientProxy(assemblies, revitVersion, serverHost, useStreamed: true);
-			}
-			catch (Exception ex)
-			{
-				// Fallback to buffered proxy when streaming binding is unavailable (e.g. net.tcp stream issues)
+				ct.ThrowIfCancellationRequested();
+				var rvtPath = Path.Combine(workDir, "model.rvt");
 				try
 				{
-					var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_StreamProxy_Fallback.txt");
-					System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Streamed proxy failed: {ex.GetBaseException().Message}\n");
+					session.GenerateRvtFile(dataDir, dataFormatVersion, rvtPath);
 				}
-				catch { }
-				clientProxy = GetGenericClientProxy(assemblies, revitVersion, serverHost, useStreamed: false);
-			}
-			var iModelServiceType = assemblies.GetType("Autodesk.RevitServer.Enterprise.Common.ClientServer.ServiceContract.Model.IModelService");
-			if (iModelServiceType == null) throw new TypeLoadException("IModelService type not found");
-			
-			var proxy = GetProxyFromClientProxy(clientProxy);
-			TryConfigureClientProxyBinding(proxy);
-			
-			// If channel is already open, we need to recreate with proper binding
-			proxy = TryRecreateProxyWithLargeMessageSupport(clientProxy, proxy, iModelServiceType, serverHost);
-		// Resolve FileDownloadRequestMessage from available assemblies
-		Type requestType;
-		try
-		{
-			requestType = ResolveTypeAny(assemblies, new[] {
-		"Autodesk.Social.Services.Files.ServiceContracts.FileDownloadRequestMessage",
-		"Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Message.FileDownloadRequestMessage"
-	}) ?? throw new TypeLoadException("Cannot find FileDownloadRequestMessage");
-		}
-		catch (AmbiguousMatchException ex)
-		{
-			// Debug: Log which type is causing ambiguity
-			var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_ResolveTypeAny_Ambiguity.txt");
-			System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ResolveTypeAny ambiguity: {ex.Message}\n");
-			System.IO.File.AppendAllText(logPath, $"Stack trace: {ex.StackTrace}\n");
-			throw new InvalidOperationException($"ResolveTypeAny ambiguity: {ex.Message}", ex);
-		}
-		
-		// Find DownloadFile method with specific parameter type to avoid ambiguity
-		MethodInfo downloadMethod = null;
-		try
-		{
-			downloadMethod = iModelServiceType.GetMethod("DownloadFile", BindingFlags.Public | BindingFlags.Instance, null, new[] { requestType }, null);
-			if (downloadMethod == null)
-			{
-				// Try to find the method with more specific signature
-				var methods = iModelServiceType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-					.Where(m => m.Name == "DownloadFile" && m.GetParameters().Length == 1)
-					.ToArray();
-				if (methods.Length == 1)
+				catch (Exception ex)
 				{
-					downloadMethod = methods[0];
+					throw new InvalidOperationException($"Assembling the RVT file from the downloaded data of {where} failed: {ex.Message}", ex);
 				}
-				else if (methods.Length > 1)
-				{
-					// Find the one that takes the correct parameter type
-					downloadMethod = methods.FirstOrDefault(m => m.GetParameters()[0].ParameterType == requestType);
-				}
-			}
-			if (downloadMethod == null) throw new MissingMethodException(iModelServiceType.FullName, "DownloadFile");
-		}
-		catch (AmbiguousMatchException ex)
-		{
-			// Debug: List all DownloadFile methods to see the ambiguity
-			var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_DownloadFile_Methods.txt");
-			var methods = iModelServiceType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-				.Where(m => m.Name == "DownloadFile")
-				.ToArray();
-			System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] DownloadFile methods ({methods.Length}):\n");
-			foreach (var method in methods)
-			{
-				var paramTypes = method.GetParameters().Select(p => p.ParameterType.Name).ToArray();
-				System.IO.File.AppendAllText(logPath, $"  - {string.Join(", ", paramTypes)}\n");
-			}
-			throw new InvalidOperationException($"Ambiguous DownloadFile method: {ex.Message}", ex);
-		}
-
-			var serviceModelSessionTokenType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.SessionToken.ServiceModelSessionToken");
-			var episodeGuidType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.EpisodeGuid");
-			var requestCtor = requestType.GetConstructor(new[] { serviceModelSessionTokenType, episodeGuidType, typeof(string) });
-			if (requestCtor == null) throw new MissingMethodException(requestType.FullName, ".ctor(ServiceModelSessionToken,EpisodeGuid,string)");
-
-			foreach (var file in fileList)
-			{
-				// CRITICAL: Create a NEW ServiceModelSessionToken for EACH file (as AltecSystems does)
-				// This is required because the token might contain state that changes between downloads
-				var tokenForFile = CreateServiceModelSessionTokenFromExisting(assemblies, serviceModelSessionToken);
-				var sourceFileName = GetSourceFileName(assemblies, serviceModelSessionToken, file);
-
-				// Diagnostic logging
-				try
-				{
-					var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_DownloadFile_Diagnostic.txt");
-					var tokenType = tokenForFile.GetType();
-					var mlProp = tokenType.GetProperty("ModelLocation");
-					var mlVal = mlProp?.GetValue(tokenForFile);
-					System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] DownloadFile: file={file}, sourceFileName={sourceFileName}, creationDate={creationDate}, ModelLocation={mlVal}\n");
-				}
-				catch { }
-
-				var request = requestCtor.Invoke(new[] { tokenForFile, creationDate, sourceFileName });
-				var msg = downloadMethod.Invoke(proxy, new[] { request });
-				if (msg == null) throw new InvalidOperationException("DownloadFile returned null message");
-				using (var stream = ExtractStreamFromMessage(msg))
-				{
-					if (stream == null)
-					{
-						try
-						{
-							var dbg = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_DownloadFile_MessageType.txt");
-							var t = msg.GetType();
-							using (var sw = new System.IO.StreamWriter(dbg, true, System.Text.Encoding.UTF8))
-							{
-								sw.WriteLine($"\n==== {DateTime.Now:yyyy-MM-dd HH:mm:ss} Message type dump ====");
-								sw.WriteLine($"Type: {t.FullName}");
-								try { sw.WriteLine($"Assembly: {t.Assembly.Location}"); } catch { }
-								sw.WriteLine("Properties:");
-								foreach (var p in t.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
-								{
-									sw.WriteLine($"  - {p.Name} : {p.PropertyType.FullName}");
-								}
-								sw.WriteLine("Fields:");
-								foreach (var f in t.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
-								{
-									sw.WriteLine($"  - {f.Name} : {f.FieldType.FullName}");
-								}
-							}
-						}
-						catch { }
-						throw new InvalidOperationException("DownloadFile returned null stream");
-					}
-					var target = Path.Combine(tempDir, Path.GetFileName(file));
-					Directory.CreateDirectory(Path.GetDirectoryName(target));
-					await CopyToFileAsync(stream, target, progress);
-				}
-			}
-		}
-
-		private static object GetSourceFileName(RsAssemblies assemblies, object serviceModelSessionToken, string fileName)
-		{
-			try
-			{
-				var tokenType = serviceModelSessionToken.GetType();
-				PropertyInfo identityProp = null;
-				try { identityProp = tokenType.GetProperty("ModelIdentity", BindingFlags.Public | BindingFlags.Instance); } catch (AmbiguousMatchException ex) { LogAmbiguity("GetSourceFileName_ModelIdentity", "ModelIdentity", ex); throw; }
-				var modelIdentity = identityProp?.GetValue(serviceModelSessionToken);
-				
-				var identityType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.ModelIdentity");
-				PropertyInfo guidProp = null;
-				try { guidProp = identityType.GetProperty("IdentityGUID", BindingFlags.Public | BindingFlags.Instance); } catch (AmbiguousMatchException ex) { LogAmbiguity("GetSourceFileName_IdentityGUID", "IdentityGUID", ex); throw; }
-				var guidValue = guidProp?.GetValue(modelIdentity);
-				
-				var guidValueType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.GUIDValue");
-				PropertyInfo guidInnerProp = null;
-				try { guidInnerProp = guidValueType.GetProperty("GUID", BindingFlags.Public | BindingFlags.Instance); } catch (AmbiguousMatchException ex) { LogAmbiguity("GetSourceFileName_GUID", "GUID", ex); throw; }
-				var guid = (Guid)guidInnerProp.GetValue(guidValue);
-				var combined = Path.Combine(guid.ToString(), fileName);
-				return combined;
-			}
-			catch (AmbiguousMatchException ex)
-			{
-				// Debug: Log which property is causing ambiguity
-				LogAmbiguity("GetSourceFileName", "unknown", ex);
-				throw new InvalidOperationException($"GetSourceFileName ambiguity: {ex.Message}", ex);
-			}
-		}
-
-		private static async Task CopyToFileAsync(Stream source, string targetPath, IProgress<long> progress)
-		{
-			const int BufferSize = 16384;
-			using (var file = File.Open(targetPath, FileMode.Create, FileAccess.Write, FileShare.None))
-			{
-				var buffer = new byte[BufferSize];
-				int read;
-				long total = 0;
-				while ((read = await source.ReadAsync(buffer, 0, buffer.Length)) > 0)
-				{
-					await file.WriteAsync(buffer, 0, read);
-					total += read;
-					progress?.Report(total);
-				}
-			}
-		}
-
-		private static void GenerateRvtFromModelData(RsAssemblies assemblies, string modelDataDir, string destinationFile, bool overwrite)
-		{
-			if (File.Exists(destinationFile))
-			{
-				if (!overwrite) throw new IOException("Destination file exists and overwrite is false");
-				File.Delete(destinationFile);
-			}
-
-			var dataFormatVersionType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.DataContract.Model.DataFormatVersion");
-			var latest = Enum.Parse(dataFormatVersionType, "Latest");
-
-			var versionMgrType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.Helper.VersionManager.ModelDataVersionManager");
-			var iVersionMgrType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.Helper.VersionManager.IModelDataVersionManager");
-			var sharedUtilsType = FindTypeAnyOrThrow(assemblies, "Autodesk.RevitServer.Enterprise.Common.ClientServer.Helper.Utils.SharedUtils");
-			PropertyInfo modelPathUtilsProp = null;
-			try { modelPathUtilsProp = sharedUtilsType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static); } catch (AmbiguousMatchException ex) { LogAmbiguity("GenerateRvtFromModelData_Instance", "Instance", ex); throw; }
-			var sharedUtilsInstance = modelPathUtilsProp?.GetValue(null);
-			PropertyInfo innerPathUtilsProp = null;
-			try { innerPathUtilsProp = sharedUtilsType.GetProperty("ModelPathUtils", BindingFlags.Public | BindingFlags.Instance); } catch (AmbiguousMatchException ex) { LogAmbiguity("GenerateRvtFromModelData_ModelPathUtils", "ModelPathUtils", ex); throw; }
-
-			var versionMgr = Activator.CreateInstance(versionMgrType, new object[] { modelDataDir, latest });
-			PropertyInfo setModelPathUtils = null;
-			try { setModelPathUtils = iVersionMgrType.GetProperty("ModelPathUtils", BindingFlags.Public | BindingFlags.Instance); } catch (AmbiguousMatchException ex) { LogAmbiguity("GenerateRvtFromModelData_SetModelPathUtils", "ModelPathUtils", ex); throw; }
-			if (setModelPathUtils != null && innerPathUtilsProp != null && sharedUtilsInstance != null)
-			{
-				var utils = innerPathUtilsProp.GetValue(sharedUtilsInstance);
-				setModelPathUtils.SetValue(versionMgr, utils);
-			}
-
-			var dictStringString = typeof(Dictionary<,>).MakeGenericType(typeof(string), typeof(string));
-			var dictIntString = typeof(Dictionary<,>).MakeGenericType(typeof(int), typeof(string));
-			var nonElem = Activator.CreateInstance(dictStringString);
-			var elem = Activator.CreateInstance(dictIntString);
-			var steel = Activator.CreateInstance(dictIntString);
-
-			// Get the specific overload that takes 3 IDictionary parameters (without Boolean)
-			var getLatestStreamFiles = iVersionMgrType.GetMethod("GetLatestStreamFiles", 
-				BindingFlags.Public | BindingFlags.Instance, 
-				null, 
-				new[] { dictStringString.MakeByRefType(), dictIntString.MakeByRefType(), dictIntString.MakeByRefType() }, 
-				null);
-			if (getLatestStreamFiles == null) throw new MissingMethodException(iVersionMgrType.FullName, "GetLatestStreamFiles(IDictionary<String,String>&, IDictionary<Int32,String>&, IDictionary<Int32,String>&)");
-			var args = new object[] { nonElem, elem, steel };
-			var ok = (bool)getLatestStreamFiles.Invoke(versionMgr, args);
-			if (!ok) throw new InvalidOperationException("GetLatestStreamFiles returned false");
-
-			// Use the correct RvtFile type name (ModelStorage.RvtFile, not OleFile.RvtFile)
-			var rvtFileType = assemblies.GetType("Autodesk.RevitServer.Enterprise.Common.ClientServer.Helper.ModelStorage.RvtFile");
-			if (rvtFileType == null) throw new TypeLoadException("RvtFile type not found: Autodesk.RevitServer.Enterprise.Common.ClientServer.Helper.ModelStorage.RvtFile");
-			MethodInfo gen = null;
-			try { gen = rvtFileType.GetMethod("GenerateRvtFileFromModelFolder", BindingFlags.Public | BindingFlags.Static); } catch (AmbiguousMatchException ex) { LogAmbiguity("GenerateRvtFromModelData_GenerateRvtFileFromModelFolder", "GenerateRvtFileFromModelFolder", ex); throw; }
-			var success = (bool)gen.Invoke(null, new object[] { args[0], args[1], args[2], latest, destinationFile });
-			if (!success) throw new InvalidOperationException("Failed to generate RVT from model data folder");
-		}
-
-		private static object GetProxyFromClientProxy(object clientProxy)
-		{
-			if (clientProxy == null) throw new ArgumentNullException(nameof(clientProxy));
-			var prop = clientProxy.GetType().GetProperty("Proxy", BindingFlags.Public | BindingFlags.Instance);
-			if (prop == null) throw new MissingMemberException(clientProxy.GetType().FullName, "Proxy");
-			return prop.GetValue(clientProxy);
-		}
-
-
-		private static string ConvertPipePathToRelativeWindowsPath(string pipePath)
-		{
-			if (string.IsNullOrWhiteSpace(pipePath)) return pipePath;
-			var p = pipePath.Trim();
-			if (p.StartsWith("|")) p = p.Substring(1);
-			var result = p.Replace('|', Path.DirectorySeparatorChar);
-			
-			// DEBUG: Log the conversion to check encoding
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_Path_Conversion.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Path conversion:\n");
-				System.IO.File.AppendAllText(logPath, $"  Input pipePath='{pipePath}'\n");
-				System.IO.File.AppendAllText(logPath, $"  Output result='{result}'\n");
-				System.IO.File.AppendAllText(logPath, $"  Input bytes: {string.Join(",", System.Text.Encoding.UTF8.GetBytes(pipePath))}\n");
-				System.IO.File.AppendAllText(logPath, $"  Output bytes: {string.Join(",", System.Text.Encoding.UTF8.GetBytes(result))}\n\n");
-			}
-			catch { }
-			
-			return result;
-		}
-
-
-		private static void TryCleanupTemp(string dir)
-		{
-			try { if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
-		}
-
-
-		private static Type FindTypeAnyOrThrow(RsAssemblies assemblies, string autodeskFullName)
-		{
-			try
-			{
-				// Try Autodesk.* namespace first (older samples) then RS.* (packaged/in newer distros)
-				Type t = null;
-				try 
-				{ 
-					t = assemblies.GetType(autodeskFullName); 
-					LogDebug("FindTypeAnyOrThrow", $"Successfully got type for '{autodeskFullName}': {t?.FullName}");
-				} 
-				catch (AmbiguousMatchException ex) 
-				{ 
-					LogAmbiguity("FindTypeAnyOrThrow", autodeskFullName, ex); 
-					throw; 
-				}
-				if (t != null) return t;
-				
-				var rsName = autodeskFullName.Replace("Autodesk.RevitServer.", "RS.");
-				try 
-				{ 
-					t = assemblies.GetType(rsName); 
-					LogDebug("FindTypeAnyOrThrow", $"Successfully got type for '{rsName}': {t?.FullName}");
-				} 
-				catch (AmbiguousMatchException ex) 
-				{ 
-					LogAmbiguity("FindTypeAnyOrThrow", rsName, ex); 
-					throw; 
-				}
-				if (t != null) return t;
-				
-				var rsEnterpriseName = autodeskFullName.Replace("Autodesk.RevitServer.Enterprise.Common.ClientServer", "RS.Enterprise.Common.ClientServer");
-				try 
-				{ 
-					t = assemblies.GetType(rsEnterpriseName); 
-					LogDebug("FindTypeAnyOrThrow", $"Successfully got type for '{rsEnterpriseName}': {t?.FullName}");
-				} 
-				catch (AmbiguousMatchException ex) 
-				{ 
-					LogAmbiguity("FindTypeAnyOrThrow", rsEnterpriseName, ex); 
-					throw; 
-				}
-				if (t != null) return t;
-				
-				throw new TypeLoadException($"Type not found: {autodeskFullName}");
-			}
-			catch (AmbiguousMatchException ex)
-			{
-				// Debug: Log which type is causing ambiguity
-				LogAmbiguity("FindTypeAnyOrThrow", autodeskFullName, ex);
-				throw new InvalidOperationException($"FindTypeAnyOrThrow ambiguity for '{autodeskFullName}': {ex.Message}", ex);
-			}
-		}
-
-		private static void LogDebug(string method, string message)
-		{
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"RevitServerNet_{method}_Debug.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}\n");
-			}
-			catch { }
-		}
-
-		private static void LogAmbiguity(string method, string typeName, AmbiguousMatchException ex)
-		{
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"RevitServerNet_{method}_Ambiguity.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {method} ambiguity for '{typeName}': {ex.Message}\n");
-				System.IO.File.AppendAllText(logPath, $"Stack trace: {ex.StackTrace}\n");
-			}
-			catch { }
-		}
-
-		private static Stream ExtractStreamFromMessage(object message)
-		{
-			if (message == null) return null;
-			if (message is byte[] directBytes)
-				return new MemoryStream(directBytes, writable: false);
-			var type = message.GetType();
-			// Try property named "Stream"
-			var prop = type.GetProperty("Stream", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-			if (prop != null && typeof(Stream).IsAssignableFrom(prop.PropertyType))
-				return prop.GetValue(message) as Stream;
-			// Try getter method patterns
-			var getter = type.GetMethod("get_Stream", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance) ?? type.GetMethod("GetStream", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-			if (getter != null && typeof(Stream).IsAssignableFrom(getter.ReturnType))
-				return getter.Invoke(message, null) as Stream;
-			// Fallback: search any readable Stream-typed property
-			var anyProp = type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).FirstOrDefault(p => typeof(Stream).IsAssignableFrom(p.PropertyType));
-			if (anyProp != null) return anyProp.GetValue(message) as Stream;
-			// Search fields
-			var field = type.GetField("_stream", BindingFlags.NonPublic | BindingFlags.Instance) ?? type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).FirstOrDefault(f => typeof(Stream).IsAssignableFrom(f.FieldType));
-			if (field != null) return field.GetValue(message) as Stream;
-			// Try byte[] payloads (buffered responses)
-			var byteProp = type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-				.FirstOrDefault(p => p.PropertyType == typeof(byte[]) &&
-									 (p.Name.Equals("Data", StringComparison.OrdinalIgnoreCase) ||
-									  p.Name.Equals("Bytes", StringComparison.OrdinalIgnoreCase) ||
-									  p.Name.Equals("Buffer", StringComparison.OrdinalIgnoreCase) ||
-									  p.Name.Equals("Content", StringComparison.OrdinalIgnoreCase)));
-			if (byteProp != null)
-			{
-				var bytes = byteProp.GetValue(message) as byte[];
-				if (bytes != null) return new MemoryStream(bytes, writable: false);
-			}
-			var byteField = type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-				.FirstOrDefault(f => f.FieldType == typeof(byte[]));
-			if (byteField != null)
-			{
-				var bytes = byteField.GetValue(message) as byte[];
-				if (bytes != null) return new MemoryStream(bytes, writable: false);
-			}
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_DownloadFile_MessageType.txt");
-				using (var sw = new System.IO.StreamWriter(logPath, true, System.Text.Encoding.UTF8))
-				{
-					sw.WriteLine($"\n==== {DateTime.Now:yyyy-MM-dd HH:mm:ss} Message type dump ====");
-					sw.WriteLine($"Type: {type.FullName}");
-					try { sw.WriteLine($"Assembly: {type.Assembly.Location}"); } catch { }
-					sw.WriteLine("Properties:");
-					foreach (var p in type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-					{
-						sw.WriteLine($"  - {p.Name} : {p.PropertyType.FullName}");
-					}
-					sw.WriteLine("Fields:");
-					foreach (var f in type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-					{
-						sw.WriteLine($"  - {f.Name} : {f.FieldType.FullName}");
-					}
-				}
-			}
-			catch { }
-			return null;
-		}
-
-		private static Type ResolveTypeAny(RsAssemblies assemblies, string[] candidates)
-		{
-			foreach (var full in candidates)
-			{
-				var t = assemblies.GetType(full);
-				if (t != null) return t;
-			}
-			return null;
-		}
-
-		private static Object GetGenericClientProxy(RsAssemblies assemblies, String revitVersion, String host, Boolean useStreamed)
-		{
-			try
-			{
-				var proxyProviderType = assemblies.GetType("Autodesk.RevitServer.Enterprise.Common.ClientServer.Proxy.ProxyProvider");
-				if (proxyProviderType == null) throw new TypeLoadException("ProxyProvider type not found");
-				
-				// The patched DLL uses get_Instance instead of CreateProxyInstance
-				object proxyProvider;
-				var getInstanceMethod = proxyProviderType.GetMethod("get_Instance", BindingFlags.Public | BindingFlags.Static, null, new Type[0], null);
-				if (getInstanceMethod != null)
-				{
-					// Use get_Instance (patched DLL)
-					proxyProvider = getInstanceMethod.Invoke(null, new Object[0]);
-				}
-				else
-				{
-					// Fallback to original methods
-					var createInstanceMethod = proxyProviderType.GetMethod("CreateProxyInstance", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(String) }, null);
-					if (createInstanceMethod == null)
-					{
-						createInstanceMethod = proxyProviderType.GetMethod("CreateInstance", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(String) }, null);
-						if (createInstanceMethod == null)
-						{
-							// Debug: List all available methods
-							var methods = proxyProviderType.GetMethods(BindingFlags.Public | BindingFlags.Static);
-							var methodNames = string.Join(", ", methods.Select(m => m.Name));
-							throw new MissingMethodException($"No suitable factory method found. Available methods: {methodNames}");
-						}
-					}
-					proxyProvider = createInstanceMethod.Invoke(null, new Object[] { revitVersion });
-				}
-				
-				if (proxyProvider == null) throw new InvalidOperationException("ProxyProvider factory returned null");
-
-				var iModelServiceType = assemblies.GetType("Autodesk.RevitServer.Enterprise.Common.ClientServer.ServiceContract.Model.IModelService");
-				if (iModelServiceType == null) throw new TypeLoadException("IModelService type not found");
-				
-				var methodName = useStreamed ? "GetStreamedProxy" : "GetBufferedProxy";
-				var genericMethod = proxyProviderType.GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(String) }, null);
-				if (genericMethod == null) throw new MissingMethodException($"{methodName} method not found");
-				
-				var typedMethod = genericMethod.MakeGenericMethod(iModelServiceType);
-				var clientProxy = typedMethod.Invoke(proxyProvider, new Object[] { host });
-				TryConfigureClientProxyBinding(clientProxy);
-				// Some proxy providers expose the actual channel via Proxy property
-				try
-				{
-					var innerProxy = GetProxyFromClientProxy(clientProxy);
-					TryConfigureClientProxyBinding(innerProxy);
-				}
-				catch
-				{
-					// Ignore: not all proxies expose Proxy property at this stage
-				}
-				return clientProxy;
-			}
-			catch (AmbiguousMatchException ex)
-			{
-				// Debug: Log which method is causing ambiguity
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_GetGenericClientProxy_Ambiguity.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] GetGenericClientProxy ambiguity: {ex.Message}\n");
-				System.IO.File.AppendAllText(logPath, $"Stack trace: {ex.StackTrace}\n");
-				throw new InvalidOperationException($"GetGenericClientProxy ambiguity: {ex.Message}", ex);
-			}
-		}
-
-		private const long MaxMessageSizeBytes = 5L * 1024L * 1024L * 1024L; // 5 GB
-		private const int MaxBufferSizeBytes = int.MaxValue; // max supported buffer size
-
-		private static void TryConfigureClientProxyBinding(object clientProxy)
-		{
-			if (clientProxy == null) return;
-			try
-			{
-				var binding = TryGetBindingFromClientProxy(clientProxy);
-				LogBindingDiagnostics("TryConfigureClientProxyBinding_Before", clientProxy, binding);
-				if (binding == null) return;
-				ConfigureBindingLimits(binding);
-				LogBindingDiagnostics("TryConfigureClientProxyBinding_After", clientProxy, binding);
-			}
-			catch (Exception ex)
-			{
-				// Log binding configuration failures for debugging
-				try
-				{
-					var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_BindingConfig_Error.txt");
-					System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] TryConfigureClientProxyBinding error: {ex.Message}\n{ex.StackTrace}\n\n");
-				}
-				catch { }
-			}
-		}
-
-		private static void LogBindingDiagnostics(string context, object clientProxy, Binding binding)
-		{
-			try
-			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_Binding_Diagnostics.txt");
-				var sb = new System.Text.StringBuilder();
-				sb.AppendLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] === {context} ===");
-				sb.AppendLine($"ClientProxy type: {clientProxy?.GetType().FullName ?? "null"}");
-				sb.AppendLine($"Binding type: {binding?.GetType().FullName ?? "null"}");
-				
-				if (binding != null)
-				{
-					sb.AppendLine($"Binding.Name: {binding.Name}");
-					sb.AppendLine($"Binding.Scheme: {binding.Scheme}");
-					
-					if (binding is NetTcpBinding netTcp)
-					{
-						sb.AppendLine($"NetTcpBinding.MaxReceivedMessageSize: {netTcp.MaxReceivedMessageSize}");
-						sb.AppendLine($"NetTcpBinding.MaxBufferSize: {netTcp.MaxBufferSize}");
-						sb.AppendLine($"NetTcpBinding.TransferMode: {netTcp.TransferMode}");
-					}
-					else if (binding is CustomBinding custom)
-					{
-						sb.AppendLine($"CustomBinding elements ({custom.Elements.Count}):");
-						foreach (var elem in custom.Elements)
-						{
-							sb.AppendLine($"  - {elem.GetType().Name}");
-							if (elem is TransportBindingElement transport)
-							{
-								sb.AppendLine($"    MaxReceivedMessageSize: {transport.MaxReceivedMessageSize}");
-							}
-						}
-					}
-				}
-
-				// Check if channel is already open
-				if (clientProxy is ICommunicationObject commObj)
-				{
-					sb.AppendLine($"CommunicationState: {commObj.State}");
-				}
-				
-				sb.AppendLine();
-				System.IO.File.AppendAllText(logPath, sb.ToString());
-			}
-			catch { }
-		}
-
-		private static object TryRecreateProxyWithLargeMessageSupport(object clientProxy, object innerProxy, Type iModelServiceType, string serverHost)
-		{
-			try
-			{
-				// Check if the channel is already opened - if so, binding changes won't take effect
-				if (!(innerProxy is ICommunicationObject commObj) || commObj.State != CommunicationState.Opened)
-				{
-					LogBindingError("TryRecreateProxy", $"Channel not opened yet (State={((innerProxy as ICommunicationObject)?.State.ToString() ?? "not ICommunicationObject")}), binding config should work");
-					return innerProxy; // Not opened yet, binding config should work
-				}
-
-				LogBindingError("TryRecreateProxy", $"Channel is OPENED, attempting to recreate with large message binding");
-
-				// Get the endpoint info from existing proxy - try multiple sources
-				LogBindingError("TryRecreateProxy", "Attempting to get endpoint address...");
-				var endpointAddress = TryGetEndpointAddress(clientProxy);
-				if (endpointAddress != null)
-				{
-					LogBindingError("TryRecreateProxy", $"Got endpoint from clientProxy: {endpointAddress.Uri}");
-				}
-				else
-				{
-					endpointAddress = TryGetEndpointAddress(innerProxy);
-					if (endpointAddress != null)
-					{
-						LogBindingError("TryRecreateProxy", $"Got endpoint from innerProxy: {endpointAddress.Uri}");
-					}
-				}
-				
-				if (endpointAddress == null)
-				{
-					// Cannot create proxy without knowing the correct endpoint - return original
-					LogBindingError("TryRecreateProxy", "FAILED: Cannot determine endpoint address, returning original proxy");
-					return innerProxy;
-				}
-
-				// Use the correct IModelService type from Autodesk assemblies
-				if (iModelServiceType == null)
-				{
-					LogBindingError("TryRecreateProxy", "IModelService type is null, cannot recreate proxy");
-					return innerProxy;
-				}
-				LogBindingError("TryRecreateProxy", $"Using contract type: {iModelServiceType.FullName} from {iModelServiceType.Assembly.GetName().Name}");
-
-				// Create new binding with large message support (pass URI to determine TransferMode)
-				var newBinding = CreateLargeMessageBinding(endpointAddress.Uri.Scheme, endpointAddress.Uri);
-				if (newBinding == null)
-				{
-					LogBindingError("TryRecreateProxy", $"Cannot create binding for scheme: {endpointAddress.Uri.Scheme}");
-					return innerProxy;
-				}
-				var netTcpBinding = newBinding as NetTcpBinding;
-				LogBindingError("TryRecreateProxy", $"Created {newBinding.GetType().Name} with MaxReceivedMessageSize={netTcpBinding?.MaxReceivedMessageSize}, TransferMode={netTcpBinding?.TransferMode}");
-
-				// DON'T close the old channel yet - only close after new one works!
-
-				// Create new channel factory and channel using reflection (with Autodesk's IModelService type)
-				var channelFactoryType = typeof(ChannelFactory<>).MakeGenericType(iModelServiceType);
-				object factory;
-				try
-				{
-					factory = Activator.CreateInstance(channelFactoryType, newBinding, endpointAddress);
-					LogBindingError("TryRecreateProxy", $"Created ChannelFactory<{iModelServiceType.Name}>");
-				}
-				catch (Exception factoryEx)
-				{
-					var inner = factoryEx.InnerException?.Message ?? factoryEx.Message;
-					LogBindingError("TryRecreateProxy", $"Failed to create ChannelFactory: {inner}");
-					return innerProxy; // Return original (still open)
-				}
-				
-				// DON'T call ConfigureBindingLimits here - the binding was already created with correct settings
-				// Calling it would overwrite MaxReceivedMessageSize with 5GB (long) which breaks Buffered mode
-
-				// Create channel
-				object newProxy;
-				var createChannelMethod = channelFactoryType.GetMethod("CreateChannel", Type.EmptyTypes);
-				try
-				{
-					newProxy = createChannelMethod?.Invoke(factory, null);
-				}
-				catch (Exception createEx)
-				{
-					var inner = createEx.InnerException?.Message ?? createEx.Message;
-					var innerInner = createEx.InnerException?.InnerException?.Message;
-					LogBindingError("TryRecreateProxy", $"CreateChannel failed: {inner}" + (innerInner != null ? $" -> {innerInner}" : ""));
-					return innerProxy; // Return original (still open)
-				}
-				
-				if (newProxy != null)
-				{
-					// Open the channel before use
-					if (newProxy is ICommunicationObject newChannel)
-					{
-						try
-						{
-							newChannel.Open();
-							LogBindingError("TryRecreateProxy", $"New channel opened successfully, State={newChannel.State}");
-						}
-						catch (Exception openEx)
-						{
-							var inner = openEx.InnerException?.Message ?? openEx.Message;
-							LogBindingError("TryRecreateProxy", $"Failed to open new channel: {inner}");
-							return innerProxy; // Return original (still open)
-						}
-					}
-					
-					// NOW close the old channel since new one works
-					try 
-					{ 
-						commObj.Close(TimeSpan.FromSeconds(5)); 
-						LogBindingError("TryRecreateProxy", "Old channel closed successfully");
-					} 
-					catch
-					{ 
-						try { commObj.Abort(); } catch { } 
-					}
-					
-					LogBindingError("TryRecreateProxy", $"SUCCESS: Created and opened new channel with large message binding for {iModelServiceType.Name}");
-					return newProxy;
-				}
-				else
-				{
-					LogBindingError("TryRecreateProxy", "CreateChannel returned null");
-				}
-			}
-			catch (Exception ex)
-			{
-				var inner = ex.InnerException?.Message ?? "";
-				var innerInner = ex.InnerException?.InnerException?.Message ?? "";
-				LogBindingError("TryRecreateProxy", $"Failed to recreate proxy: {ex.GetType().Name}: {ex.Message}\nInner: {inner}\nInnerInner: {innerInner}\n{ex.StackTrace}");
-			}
-			return innerProxy;
-		}
-
-		private static EndpointAddress TryGetEndpointAddress(object proxy)
-		{
-			if (proxy == null) return null;
-			try
-			{
-				var proxyType = proxy.GetType();
-				LogBindingError("TryGetEndpointAddress", $"Trying to get endpoint from {proxyType.FullName}");
-				
-				// Try IClientChannel.RemoteAddress first (most reliable for WCF proxies)
-				if (proxy is IClientChannel clientChannel)
-				{
-					LogBindingError("TryGetEndpointAddress", $"Proxy is IClientChannel, RemoteAddress={clientChannel.RemoteAddress?.Uri}");
-					if (clientChannel.RemoteAddress != null) return clientChannel.RemoteAddress;
-				}
-				
-				// Try Endpoint.Address
-				var endpointProp = proxyType.GetProperty("Endpoint", BindingFlags.Public | BindingFlags.Instance);
-				if (endpointProp != null)
-				{
-					var endpoint = endpointProp.GetValue(proxy) as ServiceEndpoint;
-					LogBindingError("TryGetEndpointAddress", $"Endpoint property found, Address={endpoint?.Address?.Uri}");
-					if (endpoint?.Address != null) return endpoint.Address;
-				}
-
-				// Try RemoteAddress property directly
-				var remoteAddrProp = proxyType.GetProperty("RemoteAddress", BindingFlags.Public | BindingFlags.Instance);
-				if (remoteAddrProp != null)
-				{
-					var addr = remoteAddrProp.GetValue(proxy) as EndpointAddress;
-					LogBindingError("TryGetEndpointAddress", $"RemoteAddress property found, Uri={addr?.Uri}");
-					if (addr != null) return addr;
-				}
-
-				// Try ChannelFactory.Endpoint.Address
-				var cfProp = proxyType.GetProperty("ChannelFactory", BindingFlags.Public | BindingFlags.Instance);
-				if (cfProp != null)
-				{
-					var cf = cfProp.GetValue(proxy);
-					if (cf != null)
-					{
-						var cfEndpointProp = cf.GetType().GetProperty("Endpoint", BindingFlags.Public | BindingFlags.Instance);
-						var cfEndpoint = cfEndpointProp?.GetValue(cf) as ServiceEndpoint;
-						LogBindingError("TryGetEndpointAddress", $"ChannelFactory.Endpoint.Address={cfEndpoint?.Address?.Uri}");
-						if (cfEndpoint?.Address != null) return cfEndpoint.Address;
-					}
-				}
-				
-				// Try to find any property that returns EndpointAddress
-				foreach (var prop in proxyType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-				{
-					if (typeof(EndpointAddress).IsAssignableFrom(prop.PropertyType))
-					{
-						try
-						{
-							var addr = prop.GetValue(proxy) as EndpointAddress;
-							if (addr != null)
-							{
-								LogBindingError("TryGetEndpointAddress", $"Found EndpointAddress in property {prop.Name}: {addr.Uri}");
-								return addr;
-							}
-						}
-						catch { }
-					}
-				}
-				
-				// Try to find Via property (sometimes used in WCF)
-				var viaProp = proxyType.GetProperty("Via", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-				if (viaProp != null)
-				{
-					var via = viaProp.GetValue(proxy) as Uri;
-					if (via != null)
-					{
-						LogBindingError("TryGetEndpointAddress", $"Found Via property: {via}");
-						return new EndpointAddress(via);
-					}
-				}
-				
-				LogBindingError("TryGetEndpointAddress", "No endpoint address found via standard properties");
-				
-				// Last resort: dump all properties and fields to find URI
-				DumpProxyStructure(proxy, proxyType);
-				
-				// Try to find URI in any field
-				foreach (var field in proxyType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+				if (options.CreateLocal)
 				{
 					try
 					{
-						var val = field.GetValue(proxy);
-						if (val is Uri uri)
-						{
-							LogBindingError("TryGetEndpointAddress", $"Found Uri in field {field.Name}: {uri}");
-							return new EndpointAddress(uri);
-						}
-						if (val is EndpointAddress ea)
-						{
-							LogBindingError("TryGetEndpointAddress", $"Found EndpointAddress in field {field.Name}: {ea.Uri}");
-							return ea;
-						}
-						// Check nested object for RemoteAddress
-						if (val != null && val is ICommunicationObject)
-						{
-							var nestedAddr = TryGetEndpointAddressFromObject(val);
-							if (nestedAddr != null) return nestedAddr;
-						}
+						session.MakeCreatedLocal(rvtPath, dataFormatVersion);
 					}
-					catch { }
-				}
-			}
-			catch (Exception ex)
-			{
-				LogBindingError("TryGetEndpointAddress", $"Exception: {ex.Message}");
-			}
-			return null;
-		}
-
-		private static EndpointAddress TryGetEndpointAddressFromObject(object obj)
-		{
-			if (obj == null) return null;
-			try
-			{
-				var t = obj.GetType();
-				// Try RemoteAddress
-				var raProp = t.GetProperty("RemoteAddress", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-				if (raProp != null)
-				{
-					var ra = raProp.GetValue(obj) as EndpointAddress;
-					if (ra != null)
+					catch (NotSupportedException ex)
 					{
-						LogBindingError("TryGetEndpointAddressFromObject", $"Found RemoteAddress: {ra.Uri}");
-						return ra;
-					}
-				}
-				// Try Via
-				var viaProp = t.GetProperty("Via", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-				if (viaProp != null)
-				{
-					var via = viaProp.GetValue(obj) as Uri;
-					if (via != null)
-					{
-						LogBindingError("TryGetEndpointAddressFromObject", $"Found Via: {via}");
-						return new EndpointAddress(via);
-					}
-				}
-			}
-			catch { }
-			return null;
-		}
-
-		private static void DumpProxyStructure(object proxy, Type proxyType)
-		{
-			try
-			{
-				var sb = new System.Text.StringBuilder();
-				sb.AppendLine($"=== Proxy Structure Dump for {proxyType.FullName} ===");
-				
-				sb.AppendLine("Interfaces:");
-				foreach (var iface in proxyType.GetInterfaces())
-				{
-					sb.AppendLine($"  - {iface.FullName}");
-				}
-				
-				sb.AppendLine("Properties:");
-				foreach (var prop in proxyType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-				{
-					try
-					{
-						var val = prop.GetValue(proxy);
-						sb.AppendLine($"  - {prop.Name}: {prop.PropertyType.Name} = {val}");
+						throw new NotSupportedException($"CreateLocal failed for {where}: {ex.Message}", ex);
 					}
 					catch (Exception ex)
 					{
-						sb.AppendLine($"  - {prop.Name}: {prop.PropertyType.Name} = [ERROR: {ex.Message}]");
+						throw new InvalidOperationException($"CreateLocal failed for {where}: {ex.Message}", ex);
 					}
 				}
-				
-				sb.AppendLine("Fields:");
-				foreach (var field in proxyType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-				{
-					try
-					{
-						var val = field.GetValue(proxy);
-						sb.AppendLine($"  - {field.Name}: {field.FieldType.Name} = {val}");
-					}
-					catch (Exception ex)
-					{
-						sb.AppendLine($"  - {field.Name}: {field.FieldType.Name} = [ERROR: {ex.Message}]");
-					}
-				}
-				
-				LogBindingError("DumpProxyStructure", sb.ToString());
-			}
-			catch { }
-		}
+				ct.ThrowIfCancellationRequested();
+				MoveToDestination(rvtPath, options.DestinationFile, options.Overwrite);
 
-		private static Binding CreateLargeMessageBinding(string scheme, Uri endpointUri = null)
-		{
-			if (string.Equals(scheme, "net.tcp", StringComparison.OrdinalIgnoreCase))
+				if (unlockFailure != null)
+				{
+					unlockFailureThrown = true;
+					var exported = new InvalidOperationException($"The model was exported to '{options.DestinationFile}', but {unlockFailure.Message}", unlockFailure.InnerException);
+					// The file is complete: callers can tell this case from a failed export without parsing the message.
+					exported.Data[ExportedFileDataKey] = options.DestinationFile;
+					exported.Data[UnlockErrorDataKey] = unlockFailure.Message;
+					throw exported;
+				}
+				return options.DestinationFile;
+			}
+			catch (Exception ex)
 			{
-				// Determine TransferMode from endpoint path
-				// /tcpbuffer -> Buffered, /tcpstreamed -> Streamed
-				var transferMode = TransferMode.Buffered; // Default to buffered
-				if (endpointUri != null)
-				{
-					var path = endpointUri.AbsolutePath.ToLowerInvariant();
-					if (path.Contains("stream"))
-					{
-						transferMode = TransferMode.Streamed;
-					}
-					else if (path.Contains("buffer"))
-					{
-						transferMode = TransferMode.Buffered;
-					}
-					LogBindingError("CreateLargeMessageBinding", $"Endpoint path '{path}' -> TransferMode.{transferMode}");
-				}
-				
-				// For Buffered mode: MaxReceivedMessageSize must fit in int (max ~2GB)
-				// For Streamed mode: MaxReceivedMessageSize can be long (up to 5GB+)
-				long maxMsgSize;
-				int maxBufSize;
-				if (transferMode == TransferMode.Buffered)
-				{
-					// Buffered: both must be int, and MaxBufferSize == MaxReceivedMessageSize
-					maxMsgSize = int.MaxValue;
-					maxBufSize = int.MaxValue;
-				}
-				else
-				{
-					// Streamed: MaxReceivedMessageSize can be large, MaxBufferSize is just for headers
-					maxMsgSize = MaxMessageSizeBytes; // 5GB
-					maxBufSize = 65536; // Small buffer for headers only
-				}
-				
-				var binding = new NetTcpBinding(SecurityMode.None)
-				{
-					MaxReceivedMessageSize = maxMsgSize,
-					MaxBufferSize = maxBufSize,
-					MaxBufferPoolSize = maxBufSize,
-					TransferMode = transferMode,
-					OpenTimeout = TimeSpan.FromMinutes(10),
-					CloseTimeout = TimeSpan.FromMinutes(10),
-					SendTimeout = TimeSpan.FromMinutes(30),
-					ReceiveTimeout = TimeSpan.FromMinutes(30)
-				};
-				ApplyReaderQuotas(binding.ReaderQuotas);
-				LogBindingError("CreateLargeMessageBinding", $"Created binding: TransferMode={transferMode}, MaxReceivedMessageSize={maxMsgSize}, MaxBufferSize={maxBufSize}");
-				return binding;
+				failure = ex;
+				if (unlockFailure != null && !unlockFailureThrown)
+					ex.Data[UnlockErrorDataKey] = unlockFailure.Message;
+				throw;
 			}
-			return null;
+			finally
+			{
+				DeleteWorkDirectory(workDir, failure);
+				SweepStaleWorkDirectories(workRoot, DateTime.UtcNow);
+			}
 		}
 
-		private static void LogBindingError(string method, string message)
+		/// <summary>
+		/// Name of the model's export mutex: "{user}_{model path with ':' instead of backslashes}_{server}", as RevitServerTool
+		/// (DataStorageToolClient.CreateRvtFileFromCentralModel) builds it. A name longer than <see cref="MaxModelMutexNameLength"/>
+		/// characters is replaced by a hash.
+		/// </summary>
+		internal static string GetModelMutexName(string userName, string modelPath, string serverHost)
 		{
+			var name = userName + "_" + modelPath.Replace('\\', ':') + "_" + serverHost;
+			if (name.Length <= MaxModelMutexNameLength) return name;
+			using (var sha = SHA256.Create())
+				return "RevitServerNet_" + BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(name.ToUpperInvariant()))).Replace("-", string.Empty);
+		}
+
+		/// <summary>
+		/// The server keeps one read lock per user name, so exports of the same model under the same user name must not overlap:
+		/// the first one to finish would release the lock of the others. The export holds a named mutex (<see cref="GetModelMutexName"/>)
+		/// from LockData to UnlockData. RevitServerTool builds the same name from its own user name (and takes the mutex earlier, before
+		/// IdentifyModel), so exports by this library and by a RevitServerTool that uses the same user name (see <see cref="ExportUserName"/>)
+		/// wait for each other in the same Windows session (other sessions have their own mutex namespace). The name is case-sensitive and
+		/// uses the server host and model path as given: another spelling of the same model is another mutex.
+		/// Must be released on the calling thread (the export runs on one thread).
+		/// </summary>
+		internal static Mutex AcquireModelMutex(string userName, string modelPath, string serverHost, string where, CancellationToken ct)
+		{
+			var name = GetModelMutexName(userName, modelPath, serverHost);
+			Mutex mutex;
 			try
 			{
-				var logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "RevitServerNet_Binding_Diagnostics.txt");
-				System.IO.File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] [{method}] {message}\n");
+				mutex = new Mutex(false, name);
 			}
-			catch { }
-		}
-
-		private static Binding TryGetBindingFromClientProxy(object clientProxy)
-		{
-			if (clientProxy == null) return null;
-			var proxyType = clientProxy.GetType();
-
-			// Try Endpoint property (ClientBase<T>)
-			var endpointProp = proxyType.GetProperty("Endpoint", BindingFlags.Public | BindingFlags.Instance);
-			if (endpointProp != null)
+			catch (UnauthorizedAccessException ex)
 			{
-				var endpoint = endpointProp.GetValue(clientProxy) as ServiceEndpoint;
-				if (endpoint?.Binding != null) return endpoint.Binding;
+				throw new InvalidOperationException(
+					$"Another process on this machine is exporting {where} under user '{userName}', and its lock (mutex '{name}') cannot be opened by this account; try again when it has finished.", ex);
 			}
-
-			// Try ChannelFactory property
-			var channelFactoryProp = proxyType.GetProperty("ChannelFactory", BindingFlags.Public | BindingFlags.Instance);
-			if (channelFactoryProp != null)
-			{
-				var channelFactory = channelFactoryProp.GetValue(clientProxy);
-				var cfBinding = TryGetBindingFromChannelFactory(channelFactory);
-				if (cfBinding != null) return cfBinding;
-			}
-
-			// Try Binding property directly
-			var bindingProp = proxyType.GetProperty("Binding", BindingFlags.Public | BindingFlags.Instance);
-			if (bindingProp != null)
-			{
-				return bindingProp.GetValue(clientProxy) as Binding;
-			}
-
-			// Try IClientChannel explicit implementations (dynamic WCF proxies)
-			if (clientProxy is IClientChannel clientChannel)
-			{
-				var channelFactory = TryGetPropertyValue(clientChannel, "ChannelFactory");
-				var cfBinding = TryGetBindingFromChannelFactory(channelFactory);
-				if (cfBinding != null) return cfBinding;
-			}
-
-			return null;
-		}
-
-		private static Binding TryGetBindingFromChannelFactory(object channelFactory)
-		{
-			if (channelFactory == null) return null;
-			var cfEndpointProp = channelFactory.GetType().GetProperty("Endpoint", BindingFlags.Public | BindingFlags.Instance);
-			var cfEndpoint = cfEndpointProp?.GetValue(channelFactory) as ServiceEndpoint;
-			return cfEndpoint?.Binding;
-		}
-
-		private static object TryGetPropertyValue(object target, string propertyName)
-		{
-			if (target == null || string.IsNullOrWhiteSpace(propertyName)) return null;
 			try
 			{
-				var t = target.GetType();
-				var prop = t.GetProperty(propertyName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-				if (prop != null) return prop.GetValue(target);
-
-				// Try explicit interface implementation names
-				var explicitProp = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-					.FirstOrDefault(p => p.Name.EndsWith("." + propertyName, StringComparison.Ordinal));
-				return explicitProp?.GetValue(target);
+				var acquired = false;
+				try
+				{
+					acquired = !ct.CanBeCanceled
+						? mutex.WaitOne()
+						: WaitHandle.WaitAny(new[] { mutex, ct.WaitHandle }) == 0;
+				}
+				catch (AbandonedMutexException ex) when (ex.MutexIndex <= 0)
+				{
+					// The previous owner ended without releasing it; this thread owns the mutex now.
+					acquired = true;
+				}
+				if (!acquired)
+				{
+					ct.ThrowIfCancellationRequested();
+					throw new InvalidOperationException($"Waiting for the export mutex '{name}' ended without owning it.");
+				}
+				return mutex;
 			}
 			catch
 			{
+				mutex.Dispose();
+				throw;
+			}
+		}
+
+		/// <summary>
+		/// Runs one service call: cancellation-aware, WCF errors wrapped in <see cref="InvalidOperationException"/> with the operation and model.
+		/// </summary>
+		private static T Call<T>(string operation, string where, CancellationToken ct, Func<T> call)
+		{
+			ct.ThrowIfCancellationRequested();
+			try
+			{
+				return call();
+			}
+			catch (Exception ex) when (ct.IsCancellationRequested && !(ex is OperationCanceledException))
+			{
+				// The channel was aborted by the cancellation callback.
+				throw new OperationCanceledException($"Export of {where} was cancelled during {operation}.", ex, ct);
+			}
+			catch (EndpointNotFoundException ex)
+			{
+				throw new InvalidOperationException(
+					$"{operation} failed for {where}: no ModelService endpoint responded ({ex.Message}). Check that the server is reachable on its net.tcp port (808 by default) "
+					+ "and that RevitVersion is the year of this Revit Server.", ex);
+			}
+			catch (FaultException ex)
+			{
+				var detailType = ex.GetType().IsGenericType ? ex.GetType().GetGenericArguments()[0].Name : null;
+				throw new InvalidOperationException($"{operation} failed for {where}: server fault{(detailType == null ? string.Empty : " " + detailType)}: {ex.Message}", ex);
+			}
+			catch (Exception ex) when (ex is CommunicationException || ex is TimeoutException)
+			{
+				throw new InvalidOperationException($"{operation} failed for {where}: {ex.Message}", ex);
+			}
+		}
+
+		/// <summary>
+		/// Runs <paramref name="lockData"/> up to <paramref name="maxAttempts"/> times while the server answers Busy or with a lock contention
+		/// fault (DataLockContentionFault, PermissionLockContentionFault), waiting <paramref name="delay"/> before each retry; the wait is
+		/// cancellable. RevitServerTool retries Busy the same way (5 attempts, 10 s apart). Returns the last status; a contention fault of the
+		/// last attempt is thrown with the number of attempts.
+		/// </summary>
+		internal static string LockWithRetry(Func<string> lockData, int maxAttempts, TimeSpan delay, CancellationToken ct, out int attempts)
+		{
+			for (attempts = 1; ; attempts++)
+			{
+				try
+				{
+					var status = lockData();
+					if (status != "Busy" || attempts >= maxAttempts) return status;
+				}
+				catch (InvalidOperationException ex) when (IsLockContentionFault(ex))
+				{
+					if (attempts >= maxAttempts)
+						throw new InvalidOperationException($"{ex.Message} (after {attempts} attempts)", ex.InnerException);
+				}
+				if (delay > TimeSpan.Zero) ct.WaitHandle.WaitOne(delay);
+				ct.ThrowIfCancellationRequested();
+			}
+		}
+
+		private static bool IsLockContentionFault(InvalidOperationException ex)
+		{
+			var faultType = (ex.InnerException as FaultException)?.GetType();
+			if (faultType == null || !faultType.IsGenericType) return false;
+			var detail = faultType.GetGenericArguments()[0].Name;
+			return detail == "DataLockContentionFault" || detail == "PermissionLockContentionFault";
+		}
+
+		/// <summary>
+		/// Downloads one model data file. When the copy fails, the connection is aborted before the response is disposed, and the copy's own
+		/// exception is thrown: disposing a partly read streamed reply makes WCF read the rest of it (for up to the close timeout), and the
+		/// exception of that would replace the original one. A failure of the dispose is added to the exception's
+		/// <see cref="DownloadCloseErrorDataKey"/>.
+		/// </summary>
+		private static string Download(IModelExportSession session, string file, string target, string where, IProgress<long> progress, CancellationToken ct)
+		{
+			var response = session.DownloadFile(file, ct, out var stream);
+			try
+			{
+				if (stream == null) throw new InvalidOperationException($"DownloadFile returned no stream for '{file}' of {where}.");
+				CopyToFile(stream, target, progress, ct);
+			}
+			catch (Exception copyError)
+			{
+				session.Abort();
+				try
+				{
+					response.Dispose();
+				}
+				catch (Exception disposeError)
+				{
+					copyError.Data[DownloadCloseErrorDataKey] = $"{disposeError.GetType().Name}: {disposeError.Message}";
+				}
+				throw;
+			}
+			response.Dispose();
+			return target;
+		}
+
+		/// <summary>
+		/// UnlockData, not cancellable. Retried up to <see cref="RsExportRetryPolicy.UnlockAttempts"/> times,
+		/// <see cref="RsExportRetryPolicy.UnlockRetryDelay"/> apart, while it fails with a communication error (RevitServerTool retries
+		/// UnlockData too); a timeout is not retried, so that a server that stopped answering does not hold the export for several timeouts.
+		/// When LockData did not return (aborted or timed out) and UnlockData finds no lock, the server may still apply that LockData:
+		/// UnlockData is sent once more after <see cref="RsExportRetryPolicy.InterruptedLockDelay"/>.
+		/// Returns the failure (exception or unexpected status) instead of throwing, so that it never replaces the export's own result.
+		/// </summary>
+		/// <param name="lockAlreadyReleased">
+		/// True when LockData had returned and the first UnlockData answered WasNotLocked: the read lock was released before (another export
+		/// under the same user name) or expired.
+		/// </param>
+		private static Exception ReleaseReadLock(IModelExportSession session, string where, bool lockDataReturned, bool cancelled, RsExportRetryPolicy retryPolicy, out bool lockAlreadyReleased)
+		{
+			lockAlreadyReleased = false;
+			string status;
+			var attempt = 1;
+			while (true)
+			{
+				try
+				{
+					status = session.UnlockData(cancelled);
+					break;
+				}
+				catch (Exception ex)
+				{
+					if (!(ex is CommunicationException) || attempt >= retryPolicy.UnlockAttempts) return ex;
+				}
+				attempt++;
+				if (retryPolicy.UnlockRetryDelay > TimeSpan.Zero) Thread.Sleep(retryPolicy.UnlockRetryDelay);
+			}
+
+			if (status == "Unlocked") return null;
+			if (status != "WasNotLocked") return new InvalidOperationException($"UnlockData returned {status} for {where}.");
+			if (lockDataReturned)
+			{
+				// After a failed attempt, the lock may have been released by that attempt (its reply was lost).
+				lockAlreadyReleased = attempt == 1;
 				return null;
 			}
+
+			// LockData was interrupted: the server may apply it after this UnlockData. Ask once more when that is over.
+			if (retryPolicy.InterruptedLockDelay > TimeSpan.Zero) Thread.Sleep(retryPolicy.InterruptedLockDelay);
+			try
+			{
+				status = session.UnlockData(cancelled);
+			}
+			catch (Exception ex)
+			{
+				return ex;
+			}
+			return status == "Unlocked" || status == "WasNotLocked" ? null : new InvalidOperationException($"UnlockData returned {status} for {where}.");
 		}
 
-		private static void ConfigureBindingLimits(Binding binding)
+		private static string DescribeUnlockFailure(Exception unlockError, string userName)
 		{
-			if (binding == null) return;
+			return $"releasing the server read lock failed (UnlockData: {unlockError.GetType().Name}: {unlockError.Message}). "
+				+ $"The read lock of user '{userName}' remains on the server until it expires (12 h) or until the next export of this model from this machine releases it.";
+		}
 
-			switch (binding)
+		private static string DescribeLostReadLock(string userName, string where, string lockStatus)
+		{
+			return $"the read lock of user '{userName}' on {where} was already released when UnlockData ran (LockData returned {lockStatus}). "
+				+ "Another export under the same user name (from another Windows session, or with another spelling of ServerHost or ModelPipePath) "
+				+ "may have released it during the download, so the model may have changed while it was downloaded; or the lock expired (12 h).";
+		}
+
+		private static string ExplainLockStatus(string status)
+		{
+			switch (status)
 			{
-				case NetTcpBinding netTcp:
-					netTcp.MaxReceivedMessageSize = MaxMessageSizeBytes;
-					netTcp.MaxBufferSize = MaxBufferSizeBytes;
-					netTcp.MaxBufferPoolSize = Math.Max(netTcp.MaxBufferPoolSize, MaxBufferSizeBytes);
-					ApplyReaderQuotas(netTcp.ReaderQuotas);
-					return;
-
-				case CustomBinding custom:
-					foreach (var element in custom.Elements)
-					{
-						if (element is TransportBindingElement transport)
-						{
-							transport.MaxReceivedMessageSize = MaxMessageSizeBytes;
-						}
-						if (element is TextMessageEncodingBindingElement textEncoding)
-						{
-							ApplyReaderQuotas(textEncoding.ReaderQuotas);
-						}
-						if (element is BinaryMessageEncodingBindingElement binaryEncoding)
-						{
-							ApplyReaderQuotas(binaryEncoding.ReaderQuotas);
-						}
-						if (element is MtomMessageEncodingBindingElement mtomEncoding)
-						{
-							ApplyReaderQuotas(mtomEncoding.ReaderQuotas);
-						}
-					}
-					return;
+				case "Busy": return "the model is locked by another operation (for example a user synchronizing with central); try again later.";
+				case "Missing": return "the model's lock data is missing on the server.";
+				case "GaveUp": return "the server gave up acquiring the lock.";
+				default: return "the server did not grant the read lock.";
 			}
 		}
 
-		private static void ApplyReaderQuotas(XmlDictionaryReaderQuotas quotas)
+		private static string ExplainValidationStatus(string status)
 		{
-			if (quotas == null) return;
-			quotas.MaxDepth = Math.Max(quotas.MaxDepth, 64);
-			quotas.MaxStringContentLength = int.MaxValue;
-			quotas.MaxArrayLength = int.MaxValue;
-			quotas.MaxBytesPerRead = int.MaxValue;
-			quotas.MaxNameTableCharCount = int.MaxValue;
+			switch (status)
+			{
+				case "ModelDoesNotExist": return "the model does not exist on the server.";
+				case "ModelInUse": return "the model is in use; try again later.";
+				case "ModelCorrupt": return "the model is corrupt on the server.";
+				default: return "the server could not list the model data files.";
+			}
+		}
+
+		/// <summary>
+		/// Copies a downloaded stream to a new file in 80 KB blocks; reports the bytes written so far for this file after every block.
+		/// </summary>
+		private static void CopyToFile(Stream source, string targetPath, IProgress<long> progress, CancellationToken ct)
+		{
+			var buffer = new byte[81920];
+			long total = 0;
+			using (var file = new FileStream(targetPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+			{
+				while (true)
+				{
+					ct.ThrowIfCancellationRequested();
+					int filled = 0, read;
+					while (filled < buffer.Length && (read = source.Read(buffer, filled, buffer.Length - filled)) > 0)
+						filled += read;
+					if (filled == 0) break;
+					file.Write(buffer, 0, filled);
+					total += filled;
+					progress?.Report(total);
+					if (filled < buffer.Length) break;
+				}
+			}
+		}
+
+		/// <summary>
+		/// Moves the assembled file to <paramref name="destination"/>. It is first moved under a temporary name in the destination folder
+		/// (when the temp folder is on another volume, this is where the file is copied), then the previous destination file is replaced by
+		/// a rename in the same folder: a failure during the copy leaves the previous file untouched, and no partial file under the final name.
+		/// The temporary file is deleted on failure (a failure to delete it is added to <see cref="PartialFileCleanupErrorDataKey"/>).
+		/// </summary>
+		internal static void MoveToDestination(string source, string destination, bool overwrite)
+		{
+			var dir = Path.GetDirectoryName(Path.GetFullPath(destination));
+			Directory.CreateDirectory(dir);
+			var partial = Path.Combine(dir, Path.GetFileName(destination) + "." + Guid.NewGuid().ToString("N") + ".partial");
+			try
+			{
+				File.Move(source, partial);
+				if (File.Exists(destination))
+				{
+					if (!overwrite) throw new IOException("Destination file already exists. Set Overwrite=true to replace.");
+					File.Delete(destination);
+				}
+				File.Move(partial, destination);
+			}
+			catch (Exception ex)
+			{
+				try
+				{
+					if (File.Exists(partial)) File.Delete(partial);
+				}
+				catch (Exception cleanupError) when (cleanupError is IOException || cleanupError is UnauthorizedAccessException)
+				{
+					ex.Data[PartialFileCleanupErrorDataKey] = $"Could not delete '{partial}': {cleanupError.Message}";
+				}
+				throw;
+			}
+		}
+
+		/// <summary>
+		/// Deletes the temp folder, retrying a few times: a file that was just written can stay in a delete-pending state for a
+		/// moment (for example while an antivirus scans it), and the folder cannot be removed until it is gone. A final failure
+		/// does not replace the export's result: it is attached to the exception that ended the export
+		/// (<see cref="TempCleanupErrorDataKey"/>), or written to <see cref="Trace"/> after a successful export.
+		/// A folder left behind is removed by a later export (<see cref="SweepStaleWorkDirectories"/>).
+		/// </summary>
+		internal static void DeleteWorkDirectory(string workDir, Exception failure)
+		{
+			const int attempts = 5;
+			for (var attempt = 1; Directory.Exists(workDir); attempt++)
+			{
+				try
+				{
+					Directory.Delete(workDir, true);
+					return;
+				}
+				catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+				{
+					if (attempt < attempts)
+					{
+						Thread.Sleep(100 * attempt);
+						continue;
+					}
+					var message = $"Could not delete the temp folder '{workDir}': {ex.Message}";
+					if (failure != null) failure.Data[TempCleanupErrorDataKey] = message;
+					else Trace.TraceWarning("RevitServerNet: " + message);
+					return;
+				}
+			}
+		}
+
+		/// <summary>
+		/// Deletes work folders directly under <paramref name="root"/> whose last write is older than <see cref="StaleWorkDirectoryAge"/>:
+		/// left by an export whose cleanup failed or whose process was killed (also the "RevitServerNet_ModelData_{guid}" folders of
+		/// versions before 1.3.0). The age keeps the folders of exports that are still running in other processes. Best effort: a failure
+		/// is written with <see cref="Trace.TraceWarning(string)"/> and never affects the export.
+		/// </summary>
+		internal static void SweepStaleWorkDirectories(string root, DateTime utcNow)
+		{
+			List<string> directories;
+			try
+			{
+				directories = Directory.EnumerateDirectories(root, WorkDirectoryPrefix + "*", SearchOption.TopDirectoryOnly).ToList();
+			}
+			catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+			{
+				Trace.TraceWarning($"RevitServerNet: could not look for old export temp folders in '{root}': {ex.Message}");
+				return;
+			}
+			foreach (var dir in directories)
+			{
+				if (!WorkDirectoryName.IsMatch(Path.GetFileName(dir))) continue;
+				try
+				{
+					if (utcNow - Directory.GetLastWriteTimeUtc(dir) <= StaleWorkDirectoryAge) continue;
+					Directory.Delete(dir, true);
+				}
+				catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+				{
+					Trace.TraceWarning($"RevitServerNet: could not delete the old export temp folder '{dir}': {ex.Message}");
+				}
+			}
+		}
+
+		/// <summary>
+		/// The export's session with the Revit Server ModelService, through the loaded Autodesk client assemblies.
+		/// </summary>
+		private sealed class ModelServiceSession : IModelExportSession
+		{
+			private readonly RsModelServiceApi _api;
+			private readonly ModelServiceConnection _connection;
+			private readonly string _serverHost;
+			private readonly string _modelPath;
+			private readonly string _where;
+			private readonly string _userName = ExportUserName;
+			private readonly string _machineName = Environment.MachineName;
+			private readonly object _modelLocation;
+			private object _identity;
+			private Guid _identityGuid;
+			private object _creationDate;
+
+			public ModelServiceSession(RsModelExporterOptions options, Uri endpoint, string where)
+			{
+				var assemblies = RsAssemblyLoader.Load(options.RevitVersion, options.AssembliesPath);
+				_api = RsModelServiceApi.For(assemblies);
+				_serverHost = options.ServerHost.Trim();
+				_modelPath = PathUtils.ConvertPipePathToRelativeWindowsPath(options.ModelPipePath);
+				_where = where;
+				_modelLocation = _api.NewModelLocation(_serverHost, _modelPath);
+				_connection = new ModelServiceConnection(_api, endpoint);
+			}
+
+			public void IdentifyModel(CancellationToken ct)
+			{
+				var identity = _api.IdentifyModel(_connection.GetChannel(ct), _api.NewServiceSessionToken(_userName, _machineName), _modelPath);
+				if (!_api.IsValidIdentity(identity))
+					throw new InvalidOperationException($"IdentifyModel returned no valid model identity for {_where}.");
+				_identity = identity;
+				_identityGuid = _api.GetIdentityGuid(identity);
+			}
+
+			public string LockData(Action lockMayBeHeld, CancellationToken ct)
+			{
+				var channel = _connection.GetChannel(ct);
+				var token = NewToken();
+				lockMayBeHeld();
+				var status = _api.LockData(channel, token, out var creationDate);
+				_creationDate = creationDate;
+				return status;
+			}
+
+			public string GetListOfModelDataFiles(CancellationToken ct, out List<string> files)
+			{
+				return _api.GetListOfModelDataFiles(_connection.GetChannel(ct), NewToken(), out files);
+			}
+
+			public IDisposable DownloadFile(string file, CancellationToken ct, out Stream stream)
+			{
+				var request = _api.NewDownloadRequest(NewToken(), _creationDate, Path.Combine(_identityGuid.ToString(), file));
+				return _api.DownloadFile(_connection.GetChannel(ct), request, out stream);
+			}
+
+			public object ModelDataFormatVersion(CancellationToken ct)
+			{
+				return _api.ModelDataFormatVersion(_connection.GetChannel(ct), NewToken());
+			}
+
+			public string UnlockData(bool cancelled)
+			{
+				var channel = _connection.GetChannel();
+				if (cancelled) ((IContextChannel)channel).OperationTimeout = RsModelServiceEndpoint.CancelledUnlockTimeout;
+				return _api.UnlockData(channel, NewToken());
+			}
+
+			public void Abort() => _connection.Abort();
+
+			public void Close() => _connection.Dispose();
+
+			public void GenerateRvtFile(string dataDirectory, object dataFormatVersion, string rvtPath)
+			{
+				_api.GenerateRvtFile(dataDirectory, dataFormatVersion, rvtPath);
+			}
+
+			public void MakeCreatedLocal(string rvtPath, object dataFormatVersion)
+			{
+				_api.MakeCreatedLocal(rvtPath, dataFormatVersion, _identity, "RSN://" + _serverHost + "/" + _modelPath.Replace('\\', '/'));
+			}
+
+			/// <summary>
+			/// New ServiceModelSessionToken for every call, as RevitServerTool does.
+			/// </summary>
+			private object NewToken() => _api.NewModelSessionToken(_identity, _userName, _machineName, _modelLocation);
+		}
+
+		/// <summary>
+		/// One ChannelFactory and channel for IModelService. A new pair is created when the channel is missing or no longer open
+		/// (after <see cref="Abort"/> or a communication failure).
+		/// </summary>
+		private sealed class ModelServiceConnection : IDisposable
+		{
+			private readonly object _gate = new object();
+			private readonly RsModelServiceApi _api;
+			private readonly Uri _endpoint;
+			private ChannelFactory _factory;
+			private ICommunicationObject _channel;
+
+			public ModelServiceConnection(RsModelServiceApi api, Uri endpoint)
+			{
+				_api = api;
+				_endpoint = endpoint;
+			}
+
+			/// <summary>
+			/// <see cref="GetChannel()"/>, then throws when <paramref name="ct"/> is cancelled. A cancellation whose abort ran before the
+			/// channel was created would otherwise leave the call on a new channel that nothing aborts; an abort that runs after this
+			/// check reaches the new channel.
+			/// </summary>
+			public object GetChannel(CancellationToken ct)
+			{
+				var channel = GetChannel();
+				ct.ThrowIfCancellationRequested();
+				return channel;
+			}
+
+			public object GetChannel()
+			{
+				lock (_gate)
+				{
+					if (_channel != null && _channel.State == CommunicationState.Opened) return _channel;
+					AbortCore();
+					var factoryType = typeof(ChannelFactory<>).MakeGenericType(_api.ModelServiceType);
+					ChannelFactory factory;
+					try
+					{
+						factory = (ChannelFactory)CreateInstance(factoryType, RsModelServiceEndpoint.CreateBinding(), new EndpointAddress(_endpoint));
+					}
+					catch (Exception ex)
+					{
+						// For example a set built for .NET 8 (Revit 2025 and later) loaded on .NET Framework.
+						throw new InvalidOperationException(
+							$"The WCF client for IModelService could not be created from the Revit Server client assemblies in '{_api.Directory}'"
+							+ $"{RsAssemblyLoader.DescribeSkipped(_api.SkippedCandidates)}: {ex.Message}", ex);
+					}
+					// As Autodesk's own client: no limit on the number of serialized objects per message.
+					foreach (var operation in factory.Endpoint.Contract.Operations)
+					{
+						var serializer = operation.Behaviors.Find<DataContractSerializerOperationBehavior>();
+						if (serializer != null) serializer.MaxItemsInObjectGraph = int.MaxValue;
+					}
+					_factory = factory;
+					factory.Open();
+					var channel = (ICommunicationObject)InvokeMethod(factoryType.GetMethod("CreateChannel", Type.EmptyTypes), factory);
+					_channel = channel;
+					channel.Open();
+					return channel;
+				}
+			}
+
+			/// <summary>
+			/// Aborts the channel and the factory (cancellation): a blocked call fails at once.
+			/// </summary>
+			public void Abort()
+			{
+				lock (_gate) AbortCore();
+			}
+
+			public void Dispose()
+			{
+				ICommunicationObject channel, factory;
+				lock (_gate)
+				{
+					channel = _channel;
+					factory = _factory;
+					_channel = null;
+					_factory = null;
+				}
+				CloseOrAbort(channel);
+				CloseOrAbort(factory);
+			}
+
+			private void AbortCore()
+			{
+				_channel?.Abort();
+				_factory?.Abort();
+				_channel = null;
+				_factory = null;
+			}
+
+			private static void CloseOrAbort(ICommunicationObject obj)
+			{
+				if (obj == null) return;
+				if (obj.State != CommunicationState.Opened)
+				{
+					obj.Abort();
+					return;
+				}
+				try
+				{
+					obj.Close();
+				}
+				catch (Exception ex) when (ex is CommunicationException || ex is TimeoutException)
+				{
+					// The export's result is already decided; a channel that cannot be closed cleanly is aborted.
+					obj.Abort();
+				}
+			}
+
+			private static object CreateInstance(Type type, params object[] args)
+			{
+				try
+				{
+					return Activator.CreateInstance(type, args);
+				}
+				catch (TargetInvocationException ex) when (ex.InnerException != null)
+				{
+					System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+					throw;
+				}
+			}
+
+			private static object InvokeMethod(MethodInfo method, object target)
+			{
+				try
+				{
+					return method.Invoke(target, null);
+				}
+				catch (TargetInvocationException ex) when (ex.InnerException != null)
+				{
+					System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+					throw;
+				}
+			}
 		}
 	}
 }
-

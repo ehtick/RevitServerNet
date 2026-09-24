@@ -1,6 +1,7 @@
 using System;
-using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
+using RevitServerNet.Tools;
 
 namespace RevitServerNet.Extensions
 {
@@ -12,54 +13,67 @@ namespace RevitServerNet.Extensions
         /// <summary>
         /// Export a model using server host and version inferred from the API client.
         /// </summary>
-        public static async Task<string> ExportModelAsync(this RevitServerApi api, string modelPath, string destinationFile, string assembliesPath = null, bool overwrite = false, IProgress<long> bytesProgress = null)
+        public static Task<string> ExportModelAsync(this RevitServerApi api, string modelPath, string destinationFile, string assembliesPath = null, bool overwrite = false, IProgress<long> bytesProgress = null)
+        {
+            // createLocal: false keeps the behaviour of this signature before 1.3.0 (the file keeps the server's BasicFileInfo).
+            return ExportModelAsync(api, modelPath, destinationFile, false, assembliesPath, overwrite, bytesProgress, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Export a model using server host and version inferred from the API client.
+        /// </summary>
+        /// <param name="api">Client whose BaseUrl gives the host (without the HTTP port) and the year.</param>
+        /// <param name="modelPath">Model path in pipe format or Windows-style relative path.</param>
+        /// <param name="destinationFile">RVT file to create.</param>
+        /// <param name="createLocal">Write the BasicFileInfo of a local copy, as RevitServerTool does (see <see cref="ModelExporterOptions.CreateLocal"/>).</param>
+        /// <param name="assembliesPath">Optional directory with the Revit Server client assemblies, searched first; skipped when it does not contain
+        /// all of them (see <see cref="ModelExporterOptions.AssembliesPath"/>).</param>
+        /// <param name="overwrite">Replace an existing destination file.</param>
+        /// <param name="bytesProgress">Bytes downloaded so far of the current model data file.</param>
+        /// <param name="cancellationToken">Cancels the export.</param>
+        public static async Task<string> ExportModelAsync(this RevitServerApi api, string modelPath, string destinationFile, bool createLocal, string assembliesPath = null, bool overwrite = false, IProgress<long> bytesProgress = null, CancellationToken cancellationToken = default)
+        {
+            var options = CreateOptions(api, modelPath, destinationFile, createLocal, assembliesPath, overwrite);
+            return await ModelExporter.ExportAsync(options, bytesProgress, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Export options for a client: host from BaseUrl without the HTTP port, year from BaseUrl.
+        /// </summary>
+        internal static ModelExporterOptions CreateOptions(RevitServerApi api, string modelPath, string destinationFile, bool createLocal, string assembliesPath, bool overwrite)
         {
             if (api == null) throw new ArgumentNullException(nameof(api));
             if (string.IsNullOrWhiteSpace(modelPath)) throw new ArgumentException("Model path is required", nameof(modelPath));
             if (string.IsNullOrWhiteSpace(destinationFile)) throw new ArgumentException("Destination file is required", nameof(destinationFile));
 
-            // Infer version from BaseUrl
-            var version = InferVersionFromBaseUrl(api.BaseUrl) ?? "2019";
-            var host = InferHostFromBaseUrl(api.BaseUrl);
-            if (string.IsNullOrWhiteSpace(host)) throw new InvalidOperationException("Cannot infer server host from RevitServerApi.BaseUrl");
-            
-            // Debug output
-            System.Diagnostics.Debug.WriteLine($"[ExportModelAsync] BaseUrl: {api.BaseUrl}");
-            System.Diagnostics.Debug.WriteLine($"[ExportModelAsync] Detected version: {version}");
-            System.Diagnostics.Debug.WriteLine($"[ExportModelAsync] Host: {host}");
-
-//#if NETFRAMEWORK || NET6_0 || NET8_0
-            // Call public exporter
-            var options = new ModelExporterOptions
+            return new ModelExporterOptions
             {
-                ServerHost = host,
+                ServerHost = InferHostFromBaseUrl(api.BaseUrl),
                 ModelPipePath = modelPath,
                 DestinationFile = destinationFile,
-                RevitVersion = version,
+                RevitVersion = InferVersionFromBaseUrl(api.BaseUrl),
                 AssembliesPath = assembliesPath,
                 Overwrite = overwrite,
+                CreateLocal = createLocal,
             };
-            return await ModelExporter.ExportAsync(options, bytesProgress);
-//#else
-          //  throw new PlatformNotSupportedException("ExportModelAsync is only available on .NET Framework, .NET 6 or .NET 8. Use RevitServerNetTest net48/net6/net8 runner or call REST.");
-//#endif
         }
 
-        private static string InferVersionFromBaseUrl(string baseUrl)
+        /// <summary>
+        /// Year from RevitServerAdminRESTService{YEAR}; "2019" when BaseUrl has no year (a client created for 2012).
+        /// </summary>
+        internal static string InferVersionFromBaseUrl(string baseUrl)
         {
-            if (string.IsNullOrWhiteSpace(baseUrl)) return null;
-            var m = Regex.Match(baseUrl, @"RevitServerAdminRESTService(\d{4})", RegexOptions.IgnoreCase);
-            return m.Success ? m.Groups[1].Value : null;
+            return VersionUtils.ParseVersionFromBaseUrl(baseUrl) ?? "2019";
         }
 
-        private static string InferHostFromBaseUrl(string baseUrl)
+        /// <summary>
+        /// Host of BaseUrl without the HTTP port: the ModelService is reached over net.tcp on its own port.
+        /// </summary>
+        internal static string InferHostFromBaseUrl(string baseUrl)
         {
-            if (string.IsNullOrWhiteSpace(baseUrl)) return null;
-            var m = Regex.Match(baseUrl, @"^(https?://)([^/]+)", RegexOptions.IgnoreCase);
-            return m.Success ? m.Groups[2].Value : null;
+            if (string.IsNullOrWhiteSpace(baseUrl) || !Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host))
+                throw new InvalidOperationException("Cannot infer server host from RevitServerApi.BaseUrl");
+            return uri.Host;
         }
     }
 }
-
-
-

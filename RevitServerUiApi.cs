@@ -140,7 +140,7 @@ namespace RevitServerNet
                     using (var reader = new StreamReader(stream))
                     {
                         var errorContent = await reader.ReadToEndAsync();
-                        throw new RevitServerUiApiException($"UI API request failed with status {errorResponse.StatusCode}: {errorContent}", ex);
+                        throw new RevitServerUiApiException($"UI API request failed with status {errorResponse.StatusCode}: {errorContent}", errorResponse.StatusCode, errorContent, ex);
                     }
                 }
                 throw new RevitServerUiApiException("UI API request failed", ex);
@@ -341,6 +341,26 @@ namespace RevitServerNet
     {
         public RevitServerUiApiException(string message) : base(message) { }
         public RevitServerUiApiException(string message, Exception innerException) : base(message, innerException) { }
+
+        /// <summary>
+        /// Creates an exception for an HTTP error response returned by the server.
+        /// </summary>
+        public RevitServerUiApiException(string message, HttpStatusCode statusCode, string responseContent, Exception innerException)
+            : base(message, innerException)
+        {
+            StatusCode = statusCode;
+            ResponseContent = responseContent;
+        }
+
+        /// <summary>
+        /// HTTP status code of the error response; null when the server returned no HTTP response.
+        /// </summary>
+        public HttpStatusCode? StatusCode { get; }
+
+        /// <summary>
+        /// Body of the error response; null when the server returned no HTTP response.
+        /// </summary>
+        public string ResponseContent { get; }
     }
 }
 

@@ -6,21 +6,23 @@
     <AssemblyName>RevitServerNet</AssemblyName>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageId>RevitServerNet</PackageId>
-    <Version>1.2.1</Version>
+    <Version>1.3.0</Version>
     <Authors>RevitServerNet Contributors</Authors>
     <Company>RevitServerNet Contributors</Company>
     <Product>RevitServerNet</Product>
-    <Description>A .NET library for working with Revit Server REST API. Provides easy access to Revit Server operations including folder management, project operations, locking, and history tracking. Supports Revit Server versions 2012-2026.</Description>
+    <Description>A .NET library for working with Revit Server REST API. Provides easy access to Revit Server operations including folder management, project operations, locking, and history tracking. REST and Admin UI clients for Revit Server 2012 and later; direct export of models to RVT files over the Revit Server ModelService (net.tcp) with a bundled set of Autodesk client assemblies.</Description>
     <Copyright>Copyright © 2025</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/mahach666/RevitServerNet</PackageProjectUrl>
     <PackageTags>revit server api rest .net csharp autodesk bim revit-server</PackageTags>
-    <PackageReleaseNotes>Add RevitServerUiApi (Admin UI API) + UI DTO models. Generate AdminRESTService and Admin UI base paths by version (up to 2012 base name, otherwise suffix year).</PackageReleaseNotes>
+    <PackageReleaseNotes>EncodePath percent-encodes every folder/model name. Fixes names containing #, ? or an existing %XX sequence (before, the request was cut off at #, ? started a query string and %XX was decoded by the server). All other reserved characters (&amp;, +, ;, =, parentheses and others) are now escaped explicitly too; spaces and non-ASCII characters were already encoded and go over the wire as before. Behaviour of a real Revit Server with the escaped characters has not been verified yet. RenameFolderAsync escapes the new name. GetAllModelsRecursiveAsync throws instead of silently skipping a folder whose contents response is empty. RevitServerApiException and RevitServerUiApiException expose StatusCode and ResponseContent of HTTP error responses. Direct export: own WCF channel to /ModelService{year}/ (net.tcp, streamed) instead of Autodesk Proxy.dll, so the year is only a parameter; verified live against Revit Server 2022, 2023, 2024 and 2025 (docker test stand; the 2023-2025 servers served copies of 2022-format test models; BasicFileInfo in CreateLocal mode matched the official RevitServerTool 2022 and 2024 output); Revit Server 2026 and 2027 are expected to work by the same endpoint pattern but have not been verified against a live server. One bundled set of Autodesk client assemblies (Revit 2024) in RSAssemblies\ instead of one folder per year, also included in dotnet publish output (kept as files with PublishSingleFile); the loader uses only a directory that directly contains the six DLLs (no recursive search; an AssembliesPath that does not qualify is skipped) and one set per process (InvalidOperationException otherwise, also when these assemblies are already loaded from another location); the server read lock is always released (UnlockData, retried like RevitServerTool; LockData Busy is retried too) and exports of the same model wait for each other (named mutex, as RevitServerTool); CancellationToken is honoured; the RVT is assembled in %TEMP% (about twice the model size is needed there) and replaces the destination file only when complete; new CreateLocal option writes the BasicFileInfo of a local copy like RevitServerTool; errors are exceptions with the operation, endpoint and model; the %TEMP%\RevitServerNet_*.txt diagnostic files are no longer written; ExportModelAsync no longer puts the HTTP port into the net.tcp address; RevitVersion must be a four-digit year. See CHANGES.md.</PackageReleaseNotes>
     <RepositoryUrl>https://github.com/mahach666/RevitServerNet</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- Test project lives in a subfolder: keep its sources out of the library -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);RevitServerNet.Tests\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -33,16 +35,15 @@
     <PackageReference Include="System.ServiceModel.NetTcp" Version="4.9.0" />
   </ItemGroup>
 
+  <!-- Bundled Autodesk Revit Server client assemblies (the Revit 2024 set, unmodified), flat under RSAssemblies\:
+       packed into the nupkg, copied to the output and publish folders (also of projects that reference this project). -->
   <ItemGroup>
-    <None Include="RSAssemblies\**\*.dll" Pack="true" PackagePath="RSAssemblies\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="RSAssemblies\*.dll" Pack="true" PackagePath="RSAssemblies\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
 
-  <Target Name="CopyPackagedRSAssemblies" AfterTargets="Build">
-    <ItemGroup>
-      <_PackagedRS Include="$(MSBuildThisFileDirectory)RSAssemblies\**\*.dll" />
-    </ItemGroup>
-    <Copy SourceFiles="@(_PackagedRS)" DestinationFolder="$(OutDir)RSAssemblies\%(RecursiveDir)" SkipUnchangedFiles="true" Condition=" '@(_PackagedRS)' != '' " />
-  </Target>
+  <ItemGroup>
+    <InternalsVisibleTo Include="RevitServerNet.Tests" />
+  </ItemGroup>
 
   <ItemGroup>
     <Content Include="buildTransitive\RevitServerNet.props" Pack="true" PackagePath="buildTransitive\RevitServerNet.props" />

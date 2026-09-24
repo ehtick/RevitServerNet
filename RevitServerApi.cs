@@ -114,10 +114,12 @@ namespace RevitServerNet
         }
 
         /// <summary>
-        /// Encodes path in API format (replaces separators with |)
+        /// Encodes path in API format: replaces separators with |, then percent-encodes
+        /// every folder/model name (segment between |) with <see cref="Uri.EscapeDataString(string)"/>.
+        /// The | separator itself is kept as is.
         /// </summary>
-        /// <param name="path">Path to file or folder</param>
-        /// <returns>Encoded path</returns>
+        /// <param name="path">Path to file or folder with raw (unescaped) names, e.g. "|#Archive|Model.rvt"</param>
+        /// <returns>URL path segment ready to put into a command, e.g. "|%23Archive|Model.rvt"</returns>
         public static string EncodePath(string path)
         {
             if (string.IsNullOrEmpty(path))
@@ -134,7 +136,13 @@ namespace RevitServerNet
             if (!path.StartsWith("|"))
                 path = "|" + path;
 
-            return path;
+            // Names go into the URL as data: without escaping '#' cuts the request (fragment),
+            // '?' starts a query string and '%XX' is decoded by the server into another character.
+            var segments = path.Split('|');
+            for (var i = 0; i < segments.Length; i++)
+                segments[i] = Uri.EscapeDataString(segments[i]);
+
+            return string.Join("|", segments);
         }
 
         /// <summary>
@@ -217,7 +225,7 @@ namespace RevitServerNet
                     using (var reader = new StreamReader(stream))
                     {
                         var errorContent = await reader.ReadToEndAsync();
-                        throw new RevitServerApiException($"API request failed with status {errorResponse.StatusCode}: {errorContent}", ex);
+                        throw new RevitServerApiException($"API request failed with status {errorResponse.StatusCode}: {errorContent}", errorResponse.StatusCode, errorContent, ex);
                     }
                 }
                 throw new RevitServerApiException("API request failed", ex);
@@ -232,5 +240,25 @@ namespace RevitServerNet
     {
         public RevitServerApiException(string message) : base(message) { }
         public RevitServerApiException(string message, Exception innerException) : base(message, innerException) { }
+
+        /// <summary>
+        /// Creates an exception for an HTTP error response returned by the server
+        /// </summary>
+        public RevitServerApiException(string message, HttpStatusCode statusCode, string responseContent, Exception innerException)
+            : base(message, innerException)
+        {
+            StatusCode = statusCode;
+            ResponseContent = responseContent;
+        }
+
+        /// <summary>
+        /// HTTP status code of the error response; null when the server returned no HTTP response
+        /// </summary>
+        public HttpStatusCode? StatusCode { get; }
+
+        /// <summary>
+        /// Body of the error response; null when the server returned no HTTP response
+        /// </summary>
+        public string ResponseContent { get; }
     }
 }

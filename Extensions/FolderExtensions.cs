@@ -1,11 +1,10 @@
 using Newtonsoft.Json;
 using RevitServerNet.Models;
 using RevitServerNet.Tools;
-//#if NETFRAMEWORK
 using RevitServerNet.Enterprise;
-//#endif
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace RevitServerNet.Extensions
@@ -114,7 +113,7 @@ namespace RevitServerNet.Extensions
                 }
                 
                 var encodedPath = RevitServerApi.EncodePath(folderPath);
-                var command = $"{encodedPath}?newObjectName={newName}";
+                var command = $"{encodedPath}?newObjectName={Uri.EscapeDataString(newName ?? string.Empty)}";
                 var json = await api.DeleteAsync(command);
                 
                 // Check if the response indicates success
@@ -203,7 +202,9 @@ namespace RevitServerNet.Extensions
             if (string.IsNullOrEmpty(folderPath) || visited.Contains(folderPath)) return;
             visited.Add(folderPath);
             var contents = await GetFolderContentsAsync(api, folderPath);
-            if (contents == null) return;
+            // A folder that could not be read must not silently drop out: callers treat the result as the full list
+            if (contents == null)
+                throw new RevitServerApiException($"Empty response for folder contents: {folderPath}");
             if (contents.Models != null)
             {
                 foreach (var model in contents.Models)
@@ -346,32 +347,46 @@ namespace RevitServerNet.Extensions
             return JsonConvert.DeserializeObject<T>(json);
         }
 
-        // Creates a local RVT model using RS.Enterprise proxies (no RevitServerTool.exe)
-//#if NETFRAMEWORK
-        public static async Task<string> CreateLocalModelWithoutToolAsync(this RevitServerApi api, string modelPipePath, string destinationFile, string revitVersion = null, string assembliesPath = null, bool overwrite = false)
+        // Creates a local RVT model through the Revit Server ModelService directly (no RevitServerTool.exe)
+        public static Task<string> CreateLocalModelWithoutToolAsync(this RevitServerApi api, string modelPipePath, string destinationFile, string revitVersion = null, string assembliesPath = null, bool overwrite = false)
         {
+            // createLocal: false keeps the behaviour of this signature before 1.3.0 (the file keeps the server's BasicFileInfo).
+            return CreateLocalModelWithoutToolAsync(api, modelPipePath, destinationFile, false, revitVersion, assembliesPath, overwrite, null, CancellationToken.None);
+        }
+
+        // Same as above; createLocal writes the BasicFileInfo of a local copy as RevitServerTool does (ModelExporterOptions.CreateLocal)
+        public static async Task<string> CreateLocalModelWithoutToolAsync(this RevitServerApi api, string modelPipePath, string destinationFile, bool createLocal, string revitVersion = null, string assembliesPath = null, bool overwrite = false, IProgress<long> bytesProgress = null, CancellationToken cancellationToken = default)
+        {
+            if (api == null)
+                throw new ArgumentNullException(nameof(api));
             if (string.IsNullOrWhiteSpace(modelPipePath))
                 throw new ArgumentException("Model pipe path is required", nameof(modelPipePath));
             if (string.IsNullOrWhiteSpace(destinationFile))
                 throw new ArgumentException("Destination file is required", nameof(destinationFile));
 
+            var exporter = new RsModelExporter();
+            var options = CreateLocalOptions(api, modelPipePath, destinationFile, createLocal, revitVersion, assembliesPath, overwrite);
+
+            await exporter.ExportAsync(options, bytesProgress, cancellationToken).ConfigureAwait(false);
+            return destinationFile;
+        }
+
+        // Export options of CreateLocalModelWithoutToolAsync: host of BaseUrl without the HTTP port; year: revitVersion, else the year in BaseUrl, else "2022"
+        internal static RsModelExporterOptions CreateLocalOptions(RevitServerApi api, string modelPipePath, string destinationFile, bool createLocal, string revitVersion, string assembliesPath, bool overwrite)
+        {
             var version = revitVersion ?? VersionUtils.ParseVersionFromBaseUrl(api.BaseUrl) ?? "2022";
             var host = new Uri(api.BaseUrl).Host;
 
-            var exporter = new RsModelExporter();
-            var options = new RsModelExporterOptions
+            return new RsModelExporterOptions
             {
                 ServerHost = host,
                 ModelPipePath = modelPipePath,
                 DestinationFile = destinationFile,
                 RevitVersion = version,
                 AssembliesPath = assembliesPath,
-                Overwrite = overwrite
+                Overwrite = overwrite,
+                CreateLocal = createLocal
             };
-
-            await exporter.ExportAsync(options);
-            return destinationFile;
         }
-//#endif
     }
 } 

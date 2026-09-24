@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net48</TargetFrameworks>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- The live Revit Server tests of both target frameworks use the same model: run the frameworks one after another -->
+    <TestTfmsInParallel>false</TestTfmsInParallel>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RevitServerNet.csproj" />
+  </ItemGroup>
+
+  <!-- WCF exception types used by the export tests (on net8.0 they come with the library's System.ServiceModel packages) -->
+  <ItemGroup Condition="'$(TargetFramework)'=='net48'">
+    <Reference Include="System.ServiceModel" />
+  </ItemGroup>
+
+</Project>

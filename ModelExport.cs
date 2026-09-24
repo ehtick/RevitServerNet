@@ -1,9 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
-//#if NETFRAMEWORK || NET6_0 || NET8_0
 using RevitServerNet.Enterprise;
-//#endif
 
 namespace RevitServerNet
 {
@@ -13,7 +11,7 @@ namespace RevitServerNet
     public sealed class ModelExporterOptions
     {
         /// <summary>
-        /// Revit Server host name or IP (e.g. "revit-server.company.local").
+        /// Revit Server host name or IP (e.g. "revit-server.company.local"), optionally with the net.tcp port ("host:808").
         /// </summary>
         public string ServerHost { get; set; }
 
@@ -28,12 +26,16 @@ namespace RevitServerNet
         public string DestinationFile { get; set; }
 
         /// <summary>
-        /// Revit/Revit Server version (e.g. "2022", "2024").
+        /// Revit Server version as a four-digit year (e.g. "2022", "2024"); selects the endpoint /ModelService{year}/.
         /// </summary>
         public string RevitVersion { get; set; }
 
         /// <summary>
-        /// Optional absolute path to a directory containing required RS assemblies; if omitted, loader will attempt to auto-discover.
+        /// Optional directory, searched first, that directly contains the Revit Server client assemblies (the six files listed in the README).
+        /// It is used only if it contains all of them (on .NET Framework, also only if every file path is at most 259 characters).
+        /// Otherwise it is skipped, like a path that does not exist, and the search continues with &lt;app&gt;\RSAssemblies,
+        /// &lt;folder of RevitServerNet.dll&gt;\RSAssemblies, &lt;folder of the executable&gt;\RSAssemblies (.NET 6 and later),
+        /// then &lt;Program Files&gt;\Autodesk\Revit {year}\RevitServerToolCommand.
         /// </summary>
         public string AssembliesPath { get; set; }
 
@@ -41,6 +43,13 @@ namespace RevitServerNet
         /// Overwrite destination file if it already exists (default: false).
         /// </summary>
         public bool Overwrite { get; set; }
+
+        /// <summary>
+        /// Write the BasicFileInfo of a local copy, as RevitServerTool createLocalRVT does: worksharing state "Created Local",
+        /// central path RSN://{ServerHost}/{model path}, the server model as central, a new model identity.
+        /// Default false: the file keeps the server's BasicFileInfo (central model), as in earlier versions.
+        /// </summary>
+        public bool CreateLocal { get; set; }
     }
 
     /// <summary>
@@ -50,10 +59,13 @@ namespace RevitServerNet
     {
         /// <summary>
         /// Export a Revit Server model to a local RVT file using RS libraries directly.
+        /// Overlapping exports of the same model are serialized only within one Windows session and only when ServerHost and
+        /// ModelPipePath are spelled the same; otherwise one export can release the other's server read lock.
         /// </summary>
         /// <param name="options">Export options (required)</param>
-        /// <param name="bytesProgress">Optional progress reporter with downloaded bytes</param>
-        /// <param name="cancellationToken">Cancellation token (not currently used internally)</param>
+        /// <param name="bytesProgress">Optional progress reporter: bytes downloaded so far of the current model data file.
+        /// Called on a thread-pool thread: use System.Progress&lt;T&gt; or marshal to the UI thread yourself.</param>
+        /// <param name="cancellationToken">Cancels the export; the server read lock is still released and the temp folder deleted</param>
         /// <returns>Path to the created RVT file</returns>
         public static async Task<string> ExportAsync(ModelExporterOptions options, IProgress<long> bytesProgress = null, CancellationToken cancellationToken = default)
         {
@@ -62,9 +74,7 @@ namespace RevitServerNet
             if (string.IsNullOrWhiteSpace(options.ModelPipePath)) throw new ArgumentException("ModelPipePath is required", nameof(options.ModelPipePath));
             if (string.IsNullOrWhiteSpace(options.DestinationFile)) throw new ArgumentException("DestinationFile is required", nameof(options.DestinationFile));
             if (string.IsNullOrWhiteSpace(options.RevitVersion)) throw new ArgumentException("RevitVersion is required", nameof(options.RevitVersion));
-            
-//#if NETFRAMEWORK || NET6_0 || NET8_0
-            // Map public options to internal exporter options and execute
+
             var internalOptions = new RsModelExporterOptions
             {
                 ServerHost = options.ServerHost,
@@ -72,17 +82,12 @@ namespace RevitServerNet
                 DestinationFile = options.DestinationFile,
                 RevitVersion = options.RevitVersion,
                 AssembliesPath = options.AssembliesPath,
-                Overwrite = options.Overwrite
+                Overwrite = options.Overwrite,
+                CreateLocal = options.CreateLocal
             };
 
             var exporter = new RsModelExporter();
-            return await exporter.ExportAsync(internalOptions, bytesProgress);
-//#else
-//            throw new PlatformNotSupportedException("Direct RS library export is only available on .NET Framework, .NET 6 or .NET 8. Use REST APIs on other targets.");
-//#endif
+            return await exporter.ExportAsync(internalOptions, bytesProgress, cancellationToken).ConfigureAwait(false);
         }
     }
 }
-
-
-
